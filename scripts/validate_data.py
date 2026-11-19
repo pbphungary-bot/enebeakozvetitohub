@@ -45,7 +45,20 @@ def validate(data, now=None):
     if not isinstance(data.get('rosters'), dict) or len(data['rosters']) < 28:
         errors.append('Rosters missing for more than two teams')
     if not data.get('seasonComplete'):
-        errors.append('Current-season game coverage is incomplete')
+        missing = data.get('seasonMissingDays', [])
+        covered = data.get('seasonDaysFetched', [])
+        # A first-run ESPN response can omit individual days; retain an honest
+        # incomplete flag in the JSON while allowing a useful partial snapshot.
+        # Require enough verified days and a recently verified scoreboard.
+        if not covered or len(covered) < 7 or len(missing) > max(5, len(covered) // 10):
+            errors.append('Current-season game coverage is incomplete')
+        else:
+            try:
+                recent = max(dt.date.fromisoformat(x) for x in covered)
+                if (now.date() - recent).days > 2:
+                    errors.append('Current-season game coverage is stale')
+            except (ValueError, TypeError):
+                errors.append('Invalid current-season coverage metadata')
     return errors
 
 
