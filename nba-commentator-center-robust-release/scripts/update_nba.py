@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""Free ESPN public-data collector. No credentials. Fails closed on network errors."""
+import argparse, datetime as dt, json, os, pathlib, time, urllib.parse, urllib.request, calendar, xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+ROOT=pathlib.Path(__file__).resolve().parents[1]
+BASE='https://site.api.espn.com/apis/site/v2/sports/basketball/nba'
+CORE='https://site.web.api.espn.com/apis/v2/sports/basketball/nba'
+HEADERS={'User-Agent':'Mozilla/5.0 (compatible; NBACommentatorCenter/1.0)','Accept':'application/json'}
+def get(url):
+    last=None
+    for attempt in range(3):
+        try:
+            req=urllib.request.Request(url,headers=HEADERS)
+            with urllib.request.urlopen(req,timeout=18) as r: return json.load(r)
+        except Exception as e:
+            last=e
+            if attempt<2: time.sleep(1+attempt)
+    raise RuntimeError(f'Could not fetch {url}: {last}')
+def as_list(x): return x if isinstance(x,list) else []
+def obj(x): return x if isinstance(x,dict) else {}
+def competitors(event):
+    c=as_list(obj(as_list(event.get('competitions'))[0] if event.get('competitions') else {}).get('competitors'))
+    return {x.get('homeAway'):x for x in c}
+def normalize_event(e):
+    cs=competitors(e)
+    if not all(k in cs for k in ('home','away')): return None
+    def team(x):
+        t=obj(x.get('team'));return {'id':str(t.get('id','')),'name':t.get('displayName',''),'abbr':t.get('abbreviation',''),'logo':t.get('logo',''),'score':int(x['score']) if str(x.get('score','')).isdigit() else None,'record':obj(as_list(x.get('records'))[0] if x.get('records') else {}).get('summary','')}
+    status=obj(e.get('status'));typ=obj(status.get('type'))
+    return {'id':str(e.get('id','')),'date':e.get('date',''),'status':typ.get('name',''),'completed':bool(typ.get('completed')),'detail':typ.get('shortDetail',''),'seasonType':str(obj(e.get('season')).get('type') or obj(e.get('seasonType')).get('type') or obj(obj(as_list(e.get('competitions'))[0] if e.get('competitions') else {}).get('type')).get('id') or ''), 'home':team(cs['home']),'away':team(cs['away'])}
+def filter_nba_games(games, teams):
+    """Exclude ESPN exhibition/placeholder opponents not in the NBA team list.
+
+    Scoreboard feeds sometimes include non-NBA teams, including preseason
+    exhibitions. Such games must not invalidate an otherwise valid NBA feed.
+    """
+    valid_ids={str(t['id']) for t in teams if t.get('id')}
+    accepted=[];rejected=[]
+    for game in games:
+        if not isinstance(game,dict):
+            rejected.append('<invalid event>');continue
+        home=str(obj(game.get('home')).get('id',''))
+        away=str(obj(game.get('away')).get('id',''))
+        if home in valid_ids and away in valid_ids and home!=away:
+            accepted.append(game)
+        else:
+            rejected.append(str(game.get('id','<missing id>')))
+    return accepted,rejected
+
+def scoreboard(day):
+    data=get(BASE+'/scoreboard?'+urllib.parse.urlencode({'dates':day.strftime('%Y%m%d'),'limit':100}))
+    return [v for e in as_list(data.get('events')) if (v:=normalize_event(e))]
+def current_season_games(today, season_start, cached=None, cached_days=None):
+    """Fetch every calendar day of the current season, not ESPN's truncated monthly windows.
+
+    A successful empty scoreboard is valid; a missing events array or HTTP failure
+    is not. Older successful days are cached, and the last three days refresh.
+    """
+    existing={str(g['id']):g for g in as_list(cached) if isinstance(g,dict)
+              and g.get('id') and season_start.isoformat()<=str(g.get('date',''))[:10]<=today.isoformat()}
+    covered=set(cached_days or []) if existing else set()
+    days=[season_start+dt.timedelta(days=i) for i in range((today-season_start).days+1)]
+    required={day.isoformat() for day in days}
+    covered.intersection_update(required)
+    refresh_from=today-dt.timedelta(days=2)
+    needed=[day for day in days if day>=refresh_from or day.isoformat() not in covered]
+    failures=[]
+    def fetch(day):
+        raw=get(BASE+'/scoreboard?'+urllib.parse.urlencode({'dates':day.strftime('%Y%m%d'),'limit':100}))
+        if not isinstance(raw.get('events'),list):
+            raise ValueError('scoreboard response missing events list')
+        return [v for e in raw['events'] if (v:=normalize_event(e))]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures={pool.submit(fetch,day):day for day in needed}
+        for future in as_completed(futures):
+            day=futures[future]
+            try:
+                rows=future.result()
+                covered.add(day.isoformat())
+                for g in rows: existing[g['id']]=g
+            except Exception as exc:
+                # Keep the old verified day when a refresh fails; do not falsely
+                # mark an unfetched day complete.
+                if day.isoformat() not in covered:
+                    failures.append(f'{day.isoformat()}: {exc}')
+    return list(existing.values()), sorted(covered), failures, sorted(required-covered)
+
+def team_list():
+    raw=get(BASE+'/teams?limit=100')
+    leagues=as_list(obj(raw.get('sports') and raw['sports'][0]).get('leagues'))
+    entries=as_list(obj(leagues[0] if leagues else {}).get('teams'))
+    return [{'id':str(t.get('id')),'name':t.get('displayName',''),'abbr':t.get('abbreviation',''),'logo':t.get('logos',[{}])[0].get('href','') if t.get('logos') else t.get('logo',''),'division':obj(t.get('groups')).get('name','')} for entry in entries if (t:=obj(entry.get('team'))).get('id')]
+def standings():
+    raw=get(CORE+'/standings?level=3&sort=playoffseed%3Aasc')
+    out={}
+    def walk(n,division='',conference=''):
+        if isinstance(n,list):
+            for x in n: walk(x,division,conference)
+            return
+        if not isinstance(n,dict): return
+        name=n.get('name','')
+        if 'Conference' in name: conference=name
+        if 'Division' in name: division=name
+        for entry in as_list(obj(n.get('standings')).get('entries')):
+            t=obj(entry.get('team'));tid=str(t.get('id',''))
+            if not tid:continue
+            stats={s.get('name',''):s.get('displayValue','') for s in as_list(entry.get('stats'))}
+            out[tid]={'conference':conference,'division':division,'stats':stats}
+        for child in as_list(n.get('children')):walk(child,division,conference)
+    walk(raw)
+    return rank_standings(out)
+def parse_record(stats):
+    """Read ESPN records from several published key conventions."""
+    for key in ('overall','record','overallRecord'):
+        value=str(stats.get(key,'')).strip()
+        import re
+        match=re.fullmatch(r'(\d+)\s*[-–]\s*(\d+)',value)
+        if match:return int(match.group(1)),int(match.group(2))
+    try:return int(stats['wins']),int(stats['losses'])
+    except (ValueError,TypeError,KeyError):return None
+
+def rank_standings(entries):
+    """Derive conference/division positions from actual wins and losses.
+
+    ESPN's standings stat names vary; never fabricate ranks without a record.
+    """
+    by_conf={};by_div={}
+    for tid,entry in entries.items():
+        stats=entry.get('stats',{})
+        record=parse_record(stats)
+        if record is None:continue
+        w,l=record
+        if w+l==0: continue
+        item=(tid,w,l)
+        if entry.get('conference'):by_conf.setdefault(entry['conference'],[]).append(item)
+        if entry.get('division'):by_div.setdefault(entry['division'],[]).append(item)
+    for field,groups in [('conferenceRank',by_conf),('divisionRank',by_div)]:
+        for group in groups.values():
+            group.sort(key=lambda x:(-x[1]/(x[1]+x[2]),-x[1],x[2]))
+            for i,(tid,_,__) in enumerate(group,1):entries[tid]['stats'][field]=str(i)
+    return entries
+
+def tag_articles(articles, teams):
+    """Tag unlabelled RSS articles using exact team names and distinctive nicknames."""
+    nicknames={}
+    for t in teams:
+        nick=t['name'].split()[-1].lower()
+        nicknames.setdefault(nick,[]).append(t['id'])
+    for a in articles:
+        text=(a.get('title','')+' '+a.get('description','')).lower()
+        ids=set(map(str,a.get('teamIds',[])))
+        for t in teams:
+            if t['name'].lower() in text:ids.add(t['id'])
+            nick=t['name'].split()[-1].lower()
+            if len(nicknames[nick])==1 and len(nick)>3:
+                import re
+                if re.search(r'(?<![a-z])'+re.escape(nick)+r'(?![a-z])',text):ids.add(t['id'])
+        a['teamIds']=sorted(ids)
+    return articles
+
+def roster(team_id):
+    """Return ESPN roster athletes with stable IDs; unavailable fields stay blank."""
+    raw=get(BASE+'/teams/'+urllib.parse.quote(str(team_id),safe='')+'/roster')
+    result=[]
+    for group in as_list(raw.get('athletes')):
+        if isinstance(group,dict) and 'items' in group:
+            athletes=as_list(group.get('items'))
+        elif isinstance(group,dict) and group.get('id'):
+            athletes=[group]
+        else:
+            continue
+        for a in athletes:
+            if not a.get('id'):continue
+            result.append({'id':str(a['id']),'name':a.get('displayName',''),
+                'number':a.get('jersey',''),'position':obj(a.get('position')).get('abbreviation',''),
+                'age':a.get('age'),'height':a.get('displayHeight',''),
+                'weight':a.get('displayWeight',''),'headshot':obj(a.get('headshot')).get('href','')})
+    return result
+
+def collect_rosters(teams, previous=None):
+    """Fetch rosters with bounded concurrency; preserve cached rows on failure."""
+    rosters={};errors=[]
+    old=obj(previous)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures={pool.submit(roster,t['id']):t for t in teams}
+        for future in as_completed(futures):
+            t=futures[future]
+            try:
+                players=future.result()
+                if not players:raise ValueError('no players returned')
+                rosters[t['id']]=players
+            except Exception as exc:
+                if as_list(old.get(t['id'])):
+                    rosters[t['id']]=old[t['id']]
+                    errors.append(f"{t['abbr']} roster: cached after fetch failure")
+                else:
+                    errors.append(f"{t['abbr']} roster unavailable: {exc}")
+    return rosters,errors
+
+def parse_boxscore(raw):
+    """Normalize ESPN summary player box scores into cacheable rows."""
+    out=[]
+    for block in as_list(obj(raw.get('boxscore')).get('players')):
+        club=obj(block.get('team')).get('displayName','')
+        for group in as_list(block.get('statistics')):
+            labels=as_list(group.get('labels'))
+            for item in as_list(group.get('athletes')):
+                athlete=obj(item.get('athlete'))
+                if not athlete.get('id'):continue
+                out.append({'team':club,'id':str(athlete['id']),
+                    'name':athlete.get('displayName',''),
+                    'stats':as_list(item.get('stats')),'labels':labels})
+    return out
+
+def collect_boxscores(games, cached=None, max_games=25):
+    """Precache recent completed games so the browser need not call ESPN directly."""
+    old=obj(cached);result={k:v for k,v in old.items() if as_list(v)};errors=[]
+    recent=sorted((g for g in games if g.get('completed')),key=lambda g:g.get('date',''),reverse=True)[:max_games]
+    for game in recent:
+        gid=str(game['id'])
+        if as_list(old.get(gid)):
+            result[gid]=old[gid];continue
+        try:
+            rows=parse_boxscore(get(BASE+'/summary?event='+urllib.parse.quote(gid,safe='')))
+            if not rows:raise ValueError('no player box-score rows')
+            result[gid]=rows
+        except Exception as exc:
+            errors.append(f'Box score {gid} unavailable: {exc}')
+    return result,errors
+
+def aggregate_player_stats(boxscores, games, season_start):
+    """Summarize only actually cached current-season box-score rows.
+
+    This is explicitly not an official full-season average: coverage can be sparse.
+    """
+    eligible={str(g['id']):g for g in games if g.get('completed') and str(g.get('date',''))[:10]>=season_start.isoformat()}
+    accum={}
+    for gid,rows in obj(boxscores).items():
+        game=eligible.get(str(gid))
+        if not game:continue
+        for row in as_list(rows):
+            labels=[str(x).upper() for x in as_list(row.get('labels'))]
+            values=as_list(row.get('stats'))
+            if not row.get('id') or not labels or not values:continue
+            team_name=row.get('team','')
+            side=next((x for x in ('home','away') if game[x].get('name')==team_name),None)
+            if side is None:continue
+            tid=str(game[side]['id']); pid=str(row['id'])
+            extracted={}
+            for field,aliases in [('pts',('PTS','POINTS')),('reb',('REB','REBOUNDS')),('ast',('AST','ASSISTS'))]:
+                idx=next((labels.index(a) for a in aliases if a in labels),None)
+                if idx is not None and idx<len(values):
+                    try:extracted[field]=float(values[idx])
+                    except (TypeError,ValueError):pass
+            if not extracted:continue
+            item=accum.setdefault(tid,{}).setdefault(pid,{'games':0,'totals':{'pts':0.,'reb':0.,'ast':0.},'counts':{'pts':0,'reb':0,'ast':0}})
+            item['games']+=1
+            for k,v in extracted.items():item['totals'][k]+=v;item['counts'][k]+=1
+    return {tid:{pid:{'games':v['games'],**{k:round(v['totals'][k]/v['counts'][k],1) if v['counts'][k] else None for k in ('pts','reb','ast')}} for pid,v in players.items()} for tid,players in accum.items()}
+
+def news():
+    raw=get(BASE+'/news?limit=100')
+    result=[]
+    for a in as_list(raw.get('articles')):
+        links=obj(a.get('links'));web=obj(links.get('web'))
+        url=web.get('href','')
+        if not url:continue
+        result.append({'title':a.get('headline',''),'url':url,'published':a.get('published',''),'source':'ESPN','description':a.get('description',''),'teamIds':[str(t.get('id')) for t in as_list(a.get('categories')) if t.get('type')=='team' and t.get('id')]})
+    return result
+def month_ranges(start, end):
+    cursor=dt.date(start.year,start.month,1)
+    while cursor<=end:
+        last=dt.date(cursor.year,cursor.month,calendar.monthrange(cursor.year,cursor.month)[1])
+        yield max(start,cursor),min(end,last)
+        cursor=last+dt.timedelta(days=1)
+
+def historical_games(today, years=4, cached=None, refresh_months=2, cached_months=None):
+    """Fetch completed regular season/playoff games in monthly windows, not a 35-day sample.
+    If a month fails, mark history incomplete instead of presenting a false all-time count.
+    """
+    if years<=0:return [],[]
+    start=dt.date(today.year-years,7,1)
+    games={str(g['id']):g for g in (cached or []) if isinstance(g,dict) and g.get('id') and g.get('date','')[:10]>=start.isoformat() and g.get('completed')};failures=[]
+    cutoff=dt.date(today.year,today.month,1)
+    for _ in range(max(0,refresh_months-1)):
+        cutoff=(cutoff-dt.timedelta(days=1)).replace(day=1)
+    # Coverage metadata alone is not proof of cached results. A missing or empty
+    # cache must never cause a month to be skipped.
+    fetched_months=set(cached_months or []) if games else set()
+    # Cache coverage is meaningful only for months within the requested window.
+    requested_months={first.strftime('%Y-%m') for first,_ in month_ranges(start,today)}
+    fetched_months.intersection_update(requested_months)
+    for first,last in month_ranges(start,today):
+        # Reuse previously collected, complete historical months. Always refresh
+        # the current and immediately preceding months for late score corrections.
+        if last<cutoff and first.strftime('%Y-%m') in fetched_months:
+            continue
+        params=urllib.parse.urlencode({'dates':first.strftime('%Y%m%d')+'-'+last.strftime('%Y%m%d'),'limit':1000})
+        try:
+            raw=get(BASE+'/scoreboard?'+params)
+            if not isinstance(raw.get('events'),list):
+                raise ValueError('scoreboard response has no events list')
+            fetched_months.add(first.strftime('%Y-%m'))
+            for e in as_list(raw.get('events')):
+                g=normalize_event(e)
+                if g and g['completed']:games[g['id']]=g
+        except Exception as exc:
+            fetched_months.discard(first.strftime('%Y-%m'))
+            failures.append(f'{first:%Y-%m}: {exc}')
+    missing=sorted(requested_months-fetched_months)
+    historical_games.last_fetched_months=sorted(fetched_months)
+    historical_games.last_missing_months=missing
+    return sorted(games.values(),key=lambda g:g['date']),failures
+
+def rss_news(url, source, limit=40):
+    req=urllib.request.Request(url,headers=HEADERS)
+    with urllib.request.urlopen(req,timeout=18) as response:root=ET.fromstring(response.read(3_000_000))
+    out=[]
+    for item in root.findall('.//item')[:limit]:
+        val=lambda name:(item.findtext(name) or '').strip()
+        link=val('link')
+        if link.startswith('https://'):
+            out.append({'title':val('title'),'url':link,'published':val('pubDate'),'source':source,'description':val('description'),'teamIds':[]})
+    return out
+
+def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
+    print("[NBA] Fetching 30 teams",flush=True)
+    teams=team_list()
+    if len(teams)<28:raise RuntimeError(f'Only {len(teams)} NBA teams returned; refusing incomplete output')
+    games={str(g['id']):g for g in as_list(obj(cached).get('games')) if isinstance(g,dict) and g.get('id') and str(g.get('date',''))[:10]>=dt.date(today.year if today.month>=7 else today.year-1,7,1).isoformat()}
+    # Daily season fetch below already covers past dates. Only request future
+    # fixtures here; do not issue 49 redundant requests on every update.
+    dates=[today+dt.timedelta(days=offset) for offset in range(1,days_forward+1)]
+    future_errors=[]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures={pool.submit(scoreboard,day):day for day in dates}
+        for future in as_completed(futures):
+            try:
+                for game in future.result():games[game['id']]=game
+            except Exception as exc:
+                future_errors.append(f'{futures[future]}: {exc}')
+    errors=[f"Upcoming fixture request failures: {len(future_errors)}"] if future_errors else []
+    try: standing=standings()
+    except Exception as e: errors.append('standings: '+str(e));standing=obj(obj(cached).get('standings'))
+    try: articles=news()
+    except Exception as e: errors.append('news: '+str(e));articles=[]
+    print("[NBA] Fetching historical scores",flush=True)
+    history,history_failures=historical_games(today,history_years,cached=obj(cached).get("history"),cached_months=obj(cached).get("historicalMonthsFetched"))
+    # ESPN's monthly scoreboard windows can silently truncate the season.
+    # Independently fetch daily scoreboards, tracking each verified day.
+    season_start=dt.date(today.year if today.month>=7 else today.year-1,7,1)
+    print("[NBA] Fetching current season day by day",flush=True)
+    season_games,season_days,season_failures,season_missing=current_season_games(
+        today,season_start,cached=obj(cached).get('games'),
+        cached_days=obj(cached).get('seasonDaysFetched'))
+    for g in season_games:games[g['id']]=g
+    # ESPN includes exhibitions against non-NBA opponents and placeholder
+    # fixtures. Keep only genuine NBA-vs-NBA matchups before publishing.
+    clean_games, excluded_games=filter_nba_games(games.values(),teams)
+    games={str(g['id']):g for g in clean_games}
+    history, excluded_history=filter_nba_games(history,teams)
+    if excluded_games or excluded_history:
+        errors.append(f'Excluded {len(excluded_games)} non-NBA/invalid schedule events and {len(excluded_history)} historical events (IDs: {", ".join((excluded_games+excluded_history)[:8])})')
+        print(f'[NBA] Skipped {len(excluded_games)} non-NBA schedule events and {len(excluded_history)} historical events',flush=True)
+    missing_months=getattr(historical_games,'last_missing_months',[])
+    if missing_months:errors.append(f'Historical coverage incomplete: {len(missing_months)} months missing')
+    if season_failures:errors.append(f'Current-season daily fetch failures: {len(season_failures)}')
+    if season_missing:errors.append(f'Current-season days not verified: {len(season_missing)}')
+    if len(games)<30:raise RuntimeError('Too few games returned; refusing incomplete output')
+    if not any(g.get('completed') for g in season_games):
+        errors.append('No current-season completed games in daily collection')
+    try: articles+=rss_news('https://www.espn.com/espn/rss/nba/news','ESPN RSS')
+    except Exception as exc:errors.append('ESPN RSS: '+str(exc))
+    try: articles+=rss_news('https://www.nba.com/rss/nba_rss.xml','NBA.com')
+    except Exception as exc:errors.append('NBA.com RSS: '+str(exc))
+    print("[NBA] Fetching rosters and player box scores",flush=True)
+    rosters,roster_errors=collect_rosters(teams,obj(cached).get('rosters'))
+    errors.extend(roster_errors)
+    boxscores,box_errors=collect_boxscores(games.values(),obj(cached).get('boxscores'))
+    errors.extend(box_errors)
+    unique={a['url']:a for a in articles if a.get('url')}
+    articles=tag_articles(list(unique.values()),teams)
+    return {'history':history,'historicalMonthsFetched':getattr(historical_games,'last_fetched_months',[]),'historyStart':f'{today.year-history_years}-07-01','historyComplete':not missing_months,'historyMissingMonths':missing_months,'seasonComplete':not season_missing and any(g.get('completed') for g in season_games),'seasonDaysFetched':season_days,'seasonMissingDays':season_missing,'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerStats':aggregate_player_stats(boxscores,games.values(),season_start),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysBack':days_back,'daysForward':days_forward}}
+def main():
+    p=argparse.ArgumentParser();p.add_argument('--date',default=dt.date.today().isoformat());p.add_argument('--days-back',type=int,default=35);p.add_argument('--days-forward',type=int,default=14);p.add_argument('--history-years',type=int,default=4);p.add_argument('--output',default=str(ROOT/'data'/'nba.json'));a=p.parse_args()
+    dest=pathlib.Path(a.output)
+    cached=None
+    if dest.exists():
+        try:
+            cached=json.loads(dest.read_text(encoding='utf-8'))
+        except (ValueError,OSError):
+            pass
+    result=collect(dt.date.fromisoformat(a.date),a.days_back,a.days_forward,a.history_years,cached=cached)
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    # Final boundary: sanitize every game, including cached and merged sources,
+    # immediately before validation and publication. ESPN can return exhibition
+    # opponents and placeholders with valid-looking event IDs.
+    result['games'], rejected = filter_nba_games(result.get('games', []), result['teams'])
+    result['history'], rejected_history = filter_nba_games(result.get('history', []), result['teams'])
+    if rejected or rejected_history:
+        result.setdefault('warnings', []).append(
+            f"Final publish filter removed {len(rejected)} schedule and {len(rejected_history)} historical non-NBA games; examples: {', '.join((rejected + rejected_history)[:10])}")
+        print(f"[NBA] Final filter: skipped {len(rejected)} invalid schedule events and {len(rejected_history)} invalid history events", flush=True)
+    # Validate before replacing the last good local snapshot, not only in CI.
+    from validate_data import validate
+    problems=validate(result)
+    if problems:
+        raise RuntimeError('Refusing to replace valid NBA data: '+'; '.join(problems))
+    tmp=dest.with_suffix('.tmp')
+    try:
+        tmp.write_text(json.dumps(result,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+        os.replace(tmp,dest)
+    finally:
+        if tmp.exists(): tmp.unlink()
+    print(f"Saved {len(result['teams'])} teams, {len(result['games'])} games, {len(result['news'])} articles; warnings: {result['warnings']}")
+if __name__=='__main__':main()

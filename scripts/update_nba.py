@@ -28,6 +28,25 @@ def normalize_event(e):
         t=obj(x.get('team'));return {'id':str(t.get('id','')),'name':t.get('displayName',''),'abbr':t.get('abbreviation',''),'logo':t.get('logo',''),'score':int(x['score']) if str(x.get('score','')).isdigit() else None,'record':obj(as_list(x.get('records'))[0] if x.get('records') else {}).get('summary','')}
     status=obj(e.get('status'));typ=obj(status.get('type'))
     return {'id':str(e.get('id','')),'date':e.get('date',''),'status':typ.get('name',''),'completed':bool(typ.get('completed')),'detail':typ.get('shortDetail',''),'seasonType':str(obj(e.get('season')).get('type') or obj(e.get('seasonType')).get('type') or obj(obj(as_list(e.get('competitions'))[0] if e.get('competitions') else {}).get('type')).get('id') or ''), 'home':team(cs['home']),'away':team(cs['away'])}
+def filter_nba_games(games, teams):
+    """Exclude ESPN exhibition/placeholder opponents not in the NBA team list.
+
+    Scoreboard feeds sometimes include non-NBA teams, including preseason
+    exhibitions. Such games must not invalidate an otherwise valid NBA feed.
+    """
+    valid_ids={str(t['id']) for t in teams if t.get('id')}
+    accepted=[];rejected=[]
+    for game in games:
+        if not isinstance(game,dict):
+            rejected.append('<invalid event>');continue
+        home=str(obj(game.get('home')).get('id',''))
+        away=str(obj(game.get('away')).get('id',''))
+        if home in valid_ids and away in valid_ids and home!=away:
+            accepted.append(game)
+        else:
+            rejected.append(str(game.get('id','<missing id>')))
+    return accepted,rejected
+
 def scoreboard(day):
     data=get(BASE+'/scoreboard?'+urllib.parse.urlencode({'dates':day.strftime('%Y%m%d'),'limit':100}))
     return [v for e in as_list(data.get('events')) if (v:=normalize_event(e))]
@@ -305,6 +324,7 @@ def rss_news(url, source, limit=40):
     return out
 
 def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
+    print("[NBA] Fetching 30 teams",flush=True)
     teams=team_list()
     if len(teams)<28:raise RuntimeError(f'Only {len(teams)} NBA teams returned; refusing incomplete output')
     games={str(g['id']):g for g in as_list(obj(cached).get('games')) if isinstance(g,dict) and g.get('id') and str(g.get('date',''))[:10]>=dt.date(today.year if today.month>=7 else today.year-1,7,1).isoformat()}
@@ -324,14 +344,24 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
     except Exception as e: errors.append('standings: '+str(e));standing=obj(obj(cached).get('standings'))
     try: articles=news()
     except Exception as e: errors.append('news: '+str(e));articles=[]
+    print("[NBA] Fetching historical scores",flush=True)
     history,history_failures=historical_games(today,history_years,cached=obj(cached).get("history"),cached_months=obj(cached).get("historicalMonthsFetched"))
     # ESPN's monthly scoreboard windows can silently truncate the season.
     # Independently fetch daily scoreboards, tracking each verified day.
     season_start=dt.date(today.year if today.month>=7 else today.year-1,7,1)
+    print("[NBA] Fetching current season day by day",flush=True)
     season_games,season_days,season_failures,season_missing=current_season_games(
         today,season_start,cached=obj(cached).get('games'),
         cached_days=obj(cached).get('seasonDaysFetched'))
     for g in season_games:games[g['id']]=g
+    # ESPN includes exhibitions against non-NBA opponents and placeholder
+    # fixtures. Keep only genuine NBA-vs-NBA matchups before publishing.
+    clean_games, excluded_games=filter_nba_games(games.values(),teams)
+    games={str(g['id']):g for g in clean_games}
+    history, excluded_history=filter_nba_games(history,teams)
+    if excluded_games or excluded_history:
+        errors.append(f'Excluded {len(excluded_games)} non-NBA/invalid schedule events and {len(excluded_history)} historical events (IDs: {", ".join((excluded_games+excluded_history)[:8])})')
+        print(f'[NBA] Skipped {len(excluded_games)} non-NBA schedule events and {len(excluded_history)} historical events',flush=True)
     missing_months=getattr(historical_games,'last_missing_months',[])
     if missing_months:errors.append(f'Historical coverage incomplete: {len(missing_months)} months missing')
     if season_failures:errors.append(f'Current-season daily fetch failures: {len(season_failures)}')
@@ -343,6 +373,7 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
     except Exception as exc:errors.append('ESPN RSS: '+str(exc))
     try: articles+=rss_news('https://www.nba.com/rss/nba_rss.xml','NBA.com')
     except Exception as exc:errors.append('NBA.com RSS: '+str(exc))
+    print("[NBA] Fetching rosters and player box scores",flush=True)
     rosters,roster_errors=collect_rosters(teams,obj(cached).get('rosters'))
     errors.extend(roster_errors)
     boxscores,box_errors=collect_boxscores(games.values(),obj(cached).get('boxscores'))

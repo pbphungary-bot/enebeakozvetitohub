@@ -1,6 +1,12 @@
 name: Update NBA data
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/update.yml"
   schedule:
     - cron: '13,43 * * * *'
 permissions:
@@ -24,7 +30,7 @@ jobs:
       - name: Test schedule filters
         run: node tests/test_schedule_filter.js
       - name: Refresh NBA data
-        run: python scripts/update_nba.py
+        run: python -u scripts/update_nba.py
       - name: Validate refreshed data before publication
         run: python scripts/validate_data.py
       - name: Commit refreshed data
