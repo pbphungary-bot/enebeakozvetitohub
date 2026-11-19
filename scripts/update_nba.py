@@ -31,6 +31,41 @@ def normalize_event(e):
 def scoreboard(day):
     data=get(BASE+'/scoreboard?'+urllib.parse.urlencode({'dates':day.strftime('%Y%m%d'),'limit':100}))
     return [v for e in as_list(data.get('events')) if (v:=normalize_event(e))]
+def current_season_games(today, season_start, cached=None, cached_days=None):
+    """Fetch every calendar day of the current season, not ESPN's truncated monthly windows.
+
+    A successful empty scoreboard is valid; a missing events array or HTTP failure
+    is not. Older successful days are cached, and the last three days refresh.
+    """
+    existing={str(g['id']):g for g in as_list(cached) if isinstance(g,dict)
+              and g.get('id') and season_start.isoformat()<=str(g.get('date',''))[:10]<=today.isoformat()}
+    covered=set(cached_days or []) if existing else set()
+    days=[season_start+dt.timedelta(days=i) for i in range((today-season_start).days+1)]
+    required={day.isoformat() for day in days}
+    covered.intersection_update(required)
+    refresh_from=today-dt.timedelta(days=2)
+    needed=[day for day in days if day>=refresh_from or day.isoformat() not in covered]
+    failures=[]
+    def fetch(day):
+        raw=get(BASE+'/scoreboard?'+urllib.parse.urlencode({'dates':day.strftime('%Y%m%d'),'limit':100}))
+        if not isinstance(raw.get('events'),list):
+            raise ValueError('scoreboard response missing events list')
+        return [v for e in raw['events'] if (v:=normalize_event(e))]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures={pool.submit(fetch,day):day for day in needed}
+        for future in as_completed(futures):
+            day=futures[future]
+            try:
+                rows=future.result()
+                covered.add(day.isoformat())
+                for g in rows: existing[g['id']]=g
+            except Exception as exc:
+                # Keep the old verified day when a refresh fails; do not falsely
+                # mark an unfetched day complete.
+                if day.isoformat() not in covered:
+                    failures.append(f'{day.isoformat()}: {exc}')
+    return list(existing.values()), sorted(covered), failures, sorted(required-covered)
+
 def team_list():
     raw=get(BASE+'/teams?limit=100')
     leagues=as_list(obj(raw.get('sports') and raw['sports'][0]).get('leagues'))
@@ -272,29 +307,38 @@ def rss_news(url, source, limit=40):
 def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
     teams=team_list()
     if len(teams)<28:raise RuntimeError(f'Only {len(teams)} NBA teams returned; refusing incomplete output')
-    games={}
-    # Keep concurrency bounded to avoid hammering an undocumented public feed.
-    dates=[today+dt.timedelta(days=offset) for offset in range(-days_back,days_forward+1)]
+    games={str(g['id']):g for g in as_list(obj(cached).get('games')) if isinstance(g,dict) and g.get('id') and str(g.get('date',''))[:10]>=dt.date(today.year if today.month>=7 else today.year-1,7,1).isoformat()}
+    # Daily season fetch below already covers past dates. Only request future
+    # fixtures here; do not issue 49 redundant requests on every update.
+    dates=[today+dt.timedelta(days=offset) for offset in range(1,days_forward+1)]
+    future_errors=[]
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures={pool.submit(scoreboard,day):day for day in dates}
         for future in as_completed(futures):
-            for game in future.result():
-                games[game['id']]=game
-    if len(games)<30:raise RuntimeError('Too few games returned; refusing incomplete output')
-    errors=[]
+            try:
+                for game in future.result():games[game['id']]=game
+            except Exception as exc:
+                future_errors.append(f'{futures[future]}: {exc}')
+    errors=[f"Upcoming fixture request failures: {len(future_errors)}"] if future_errors else []
     try: standing=standings()
-    except Exception as e: errors.append('standings: '+str(e));standing={}
+    except Exception as e: errors.append('standings: '+str(e));standing=obj(obj(cached).get('standings'))
     try: articles=news()
     except Exception as e: errors.append('news: '+str(e));articles=[]
     history,history_failures=historical_games(today,history_years,cached=obj(cached).get("history"),cached_months=obj(cached).get("historicalMonthsFetched"))
-    # Include the entire current season in form and home/away calculations,
-    # not just the most recent 35 calendar days.
+    # ESPN's monthly scoreboard windows can silently truncate the season.
+    # Independently fetch daily scoreboards, tracking each verified day.
     season_start=dt.date(today.year if today.month>=7 else today.year-1,7,1)
-    season_games=[g for g in history if g['date'][:10]>=season_start.isoformat()]
+    season_games,season_days,season_failures,season_missing=current_season_games(
+        today,season_start,cached=obj(cached).get('games'),
+        cached_days=obj(cached).get('seasonDaysFetched'))
     for g in season_games:games[g['id']]=g
     missing_months=getattr(historical_games,'last_missing_months',[])
     if missing_months:errors.append(f'Historical coverage incomplete: {len(missing_months)} months missing')
-    if not season_games:errors.append('No current-season completed games in historical collection')
+    if season_failures:errors.append(f'Current-season daily fetch failures: {len(season_failures)}')
+    if season_missing:errors.append(f'Current-season days not verified: {len(season_missing)}')
+    if len(games)<30:raise RuntimeError('Too few games returned; refusing incomplete output')
+    if not any(g.get('completed') for g in season_games):
+        errors.append('No current-season completed games in daily collection')
     try: articles+=rss_news('https://www.espn.com/espn/rss/nba/news','ESPN RSS')
     except Exception as exc:errors.append('ESPN RSS: '+str(exc))
     try: articles+=rss_news('https://www.nba.com/rss/nba_rss.xml','NBA.com')
@@ -305,7 +349,7 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
     errors.extend(box_errors)
     unique={a['url']:a for a in articles if a.get('url')}
     articles=tag_articles(list(unique.values()),teams)
-    return {'history':history,'historicalMonthsFetched':getattr(historical_games,'last_fetched_months',[]),'historyStart':f'{today.year-history_years}-07-01','historyComplete':not missing_months,'historyMissingMonths':missing_months,'seasonComplete':not any(m >= season_start.strftime('%Y-%m') for m in missing_months) and bool(season_games),'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerStats':aggregate_player_stats(boxscores,games.values(),season_start),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysBack':days_back,'daysForward':days_forward}}
+    return {'history':history,'historicalMonthsFetched':getattr(historical_games,'last_fetched_months',[]),'historyStart':f'{today.year-history_years}-07-01','historyComplete':not missing_months,'historyMissingMonths':missing_months,'seasonComplete':not season_missing and any(g.get('completed') for g in season_games),'seasonDaysFetched':season_days,'seasonMissingDays':season_missing,'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerStats':aggregate_player_stats(boxscores,games.values(),season_start),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysBack':days_back,'daysForward':days_forward}}
 def main():
     p=argparse.ArgumentParser();p.add_argument('--date',default=dt.date.today().isoformat());p.add_argument('--days-back',type=int,default=35);p.add_argument('--days-forward',type=int,default=14);p.add_argument('--history-years',type=int,default=4);p.add_argument('--output',default=str(ROOT/'data'/'nba.json'));a=p.parse_args()
     dest=pathlib.Path(a.output)
