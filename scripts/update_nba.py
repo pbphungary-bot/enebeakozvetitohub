@@ -392,6 +392,15 @@ def main():
             pass
     result=collect(dt.date.fromisoformat(a.date),a.days_back,a.days_forward,a.history_years,cached=cached)
     dest.parent.mkdir(parents=True,exist_ok=True)
+    # Final boundary: sanitize every game, including cached and merged sources,
+    # immediately before validation and publication. ESPN can return exhibition
+    # opponents and placeholders with valid-looking event IDs.
+    result['games'], rejected = filter_nba_games(result.get('games', []), result['teams'])
+    result['history'], rejected_history = filter_nba_games(result.get('history', []), result['teams'])
+    if rejected or rejected_history:
+        result.setdefault('warnings', []).append(
+            f"Final publish filter removed {len(rejected)} schedule and {len(rejected_history)} historical non-NBA games; examples: {', '.join((rejected + rejected_history)[:10])}")
+        print(f"[NBA] Final filter: skipped {len(rejected)} invalid schedule events and {len(rejected_history)} invalid history events", flush=True)
     # Validate before replacing the last good local snapshot, not only in CI.
     from validate_data import validate
     problems=validate(result)

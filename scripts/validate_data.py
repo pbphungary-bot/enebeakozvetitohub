@@ -24,7 +24,7 @@ def validate(data, now=None):
         game_ids.add(gid)
         home, away = game.get('home', {}), game.get('away', {})
         if home.get('id') not in ids or away.get('id') not in ids or home.get('id') == away.get('id'):
-            errors.append(f'Unknown or identical competitors for game {gid}')
+            errors.append(f'Unknown or identical competitors for game {gid} (home={home.get("id")}, away={away.get("id")})')
         if game.get('completed'):
             if not isinstance(home.get('score'), int) or not isinstance(away.get('score'), int):
                 errors.append(f'Completed game {gid} lacks numeric scores')
