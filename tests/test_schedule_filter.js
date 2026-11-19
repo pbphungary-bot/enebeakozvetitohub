@@ -1,0 +1,13 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const html=fs.readFileSync('index.html','utf8');
+const js=html.split('<script>')[1].split('</script>')[0];
+const source=js.slice(js.indexOf('function filterScheduleGames('),js.indexOf('\nfunction schedule(){'));
+const ctx={};vm.createContext(ctx);vm.runInContext('const complete=g=>g.completed&&g.home.score!==null&&g.away.score!==null;'+source+';this.filter=filterScheduleGames;',ctx);
+const games=[{id:'2',date:'2026-11-21',completed:false,home:{id:'1',score:null},away:{id:'3',score:null}},{id:'1',date:'2026-11-20',completed:true,home:{id:'1',score:99},away:{id:'2',score:98}},{id:'3',date:'2026-11-22',completed:true,home:{id:'4',score:91},away:{id:'3',score:92}}];
+assert.deepStrictEqual(Array.from(ctx.filter(games,'all','all'),x=>x.id),['1','2','3']);
+assert.deepStrictEqual(Array.from(ctx.filter(games,'1','all'),x=>x.id),['1','2']);
+assert.deepStrictEqual(Array.from(ctx.filter(games,'all','completed'),x=>x.id),['1','3']);
+assert.deepStrictEqual(Array.from(ctx.filter(games,'1','upcoming'),x=>x.id),['2']);
+assert.deepStrictEqual(Array.from(ctx.filter(games,'4','upcoming'),x=>x.id),[]);
+assert.strictEqual(games[0].id,'2');
+console.log('6 schedule filter assertions passed');
