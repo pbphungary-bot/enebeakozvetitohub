@@ -32,6 +32,8 @@ jobs:
         run: node tests/test_notes_import.js
       - name: Test schedule filters
         run: node tests/test_schedule_filter.js
+      - name: Test front-end logic (H2H, preseason, dates, standings)
+        run: node tests/test_front_logic.js
       - name: Refresh NBA data
         run: python -u scripts/update_nba.py
       - name: Validate refreshed data before publication

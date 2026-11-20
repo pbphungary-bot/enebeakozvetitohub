@@ -6,6 +6,103 @@ import json
 from pathlib import Path
 
 
+MIN_REGULAR_SEASON_GAMES = 1200  # a full NBA regular season is 1,230 games
+
+
+def history_sanity_problems(history, start, end):
+    """Each completed season in the window must contain a plausible number of regular-season games.
+
+    Used by the collector before it may claim complete history, and by the validator
+    as a backstop for that claim.
+    """
+    problems = []
+    try:
+        first, last = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+    except (TypeError, ValueError):
+        return ['History window missing or invalid']
+    for year in range(first.year, last.year):
+        lo, hi = f'{year}-10-01', f'{year + 1}-07-01'
+        count = sum(1 for g in history if str(g.get('seasonType')) == '2' and lo <= str(g.get('date', ''))[:10] <= hi)
+        if count < MIN_REGULAR_SEASON_GAMES:
+            problems.append(f'Season {year}-{str(year + 1)[2:]} has only {count} regular-season games (expected ~1,230)')
+    return problems
+
+
+def _record(stats):
+    try:
+        return int(stats['wins']), int(stats['losses'])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def standings_problems(data, team_ids):
+    """Every team needs a conference, a division and an official record."""
+    problems = []
+    standings = data.get('standings') if isinstance(data.get('standings'), dict) else {}
+    divisions = {}
+    for tid in team_ids:
+        entry = standings.get(tid)
+        if not isinstance(entry, dict):
+            problems.append(f'Team {tid} missing from standings')
+            continue
+        if not entry.get('conference'):
+            problems.append(f'Team {tid} has no conference')
+        if not entry.get('division'):
+            problems.append(f'Team {tid} has no division')
+        else:
+            divisions.setdefault(entry['division'], set()).add(entry.get('conference'))
+        if _record(entry.get('stats') or {}) is None:
+            problems.append(f'Team {tid} has no official wins/losses')
+    for name, conferences in divisions.items():
+        if len(conferences) > 1:
+            problems.append(f'Division {name} spans several conferences')
+    return problems
+
+
+def record_reconciliation_problems(data, tolerance=1):
+    """Collected regular-season results must match ESPN's official W-L (within one in-flight game).
+
+    Catches preseason leakage, missing days and duplicated games. Only meaningful when
+    every current-season day was verified.
+    """
+    if not data.get('seasonComplete'):
+        return []
+    start = str(data.get('seasonStart', ''))
+    tally = {}
+    for g in data.get('games', []):
+        if not g.get('completed') or str(g.get('seasonType')) != '2' or str(g.get('date', ''))[:10] < start:
+            continue
+        home, away = g.get('home', {}), g.get('away', {})
+        if not isinstance(home.get('score'), int) or not isinstance(away.get('score'), int):
+            continue
+        hw = home['score'] > away['score']
+        tally.setdefault(home.get('id'), [0, 0])[0 if hw else 1] += 1
+        tally.setdefault(away.get('id'), [0, 0])[1 if hw else 0] += 1
+    problems = []
+    for tid, entry in (data.get('standings') or {}).items():
+        official = _record((entry or {}).get('stats') or {})
+        if official is None:
+            continue
+        w, l = tally.get(tid, [0, 0])
+        if abs(w - official[0]) > tolerance or abs(l - official[1]) > tolerance:
+            problems.append(f'Team {tid}: collected regular-season record {w}-{l} does not match official {official[0]}-{official[1]}')
+    return problems
+
+
+def history_problems(data):
+    """Historical coverage may be partial, but it must never be claimed complete falsely."""
+    problems = []
+    if not isinstance(data.get('historyComplete'), bool):
+        return ['historyComplete flag missing']
+    if data['historyComplete']:
+        if data.get('historyMissingCount'):
+            problems.append('History marked complete but days are missing')
+        problems.extend(history_sanity_problems(data.get('history', []), data.get('historyStart'), data.get('historyEnd')))
+    elif not data.get('historyTotalDays'):
+        problems.append('History coverage metadata missing (historyTotalDays)')
+    return problems
+
+
 def validate(data, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     errors = []
@@ -42,6 +139,8 @@ def validate(data, now=None):
         errors.append('Missing/invalid generatedAt')
     if not isinstance(data.get('standings'), dict) or not data['standings']:
         errors.append('No standings data available')
+    else:
+        errors.extend(standings_problems(data, ids))
     if not isinstance(data.get('rosters'), dict) or len(data['rosters']) < 28:
         errors.append('Rosters missing for more than two teams')
     if not data.get('seasonComplete'):
@@ -59,6 +158,8 @@ def validate(data, now=None):
                     errors.append('Current-season game coverage is stale')
             except (ValueError, TypeError):
                 errors.append('Invalid current-season coverage metadata')
+    errors.extend(history_problems(data))
+    errors.extend(record_reconciliation_problems(data))
     return errors
 
 
