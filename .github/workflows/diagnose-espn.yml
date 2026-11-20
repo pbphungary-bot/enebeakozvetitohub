@@ -1,23 +1,35 @@
 name: Diagnose ESPN (read-only)
-# Prints real HTTP status/body details for each ESPN URL shape the collector uses.
-# Read-only: no data is written or committed. Runs on manual dispatch, or when this
-# probe changes on a claude/** development branch.
+# Read-only verification on development branches: probes ESPN's responses and dry-runs the
+# collector twice into a TEMP file (never data/nba.json, never committed), then validates it.
+# Runs on manual dispatch, or when the collector/validator/probe change on a claude/** branch.
 on:
   workflow_dispatch:
   push:
     branches: ['claude/**']
     paths:
-      - 'scripts/diagnose_espn.py'
+      - 'scripts/**'
       - '.github/workflows/diagnose-espn.yml'
 permissions:
   contents: read
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -u scripts/diagnose_espn.py
+      - name: Probe ESPN URL shapes
+        run: python -u scripts/diagnose_espn.py
+      - name: Dry run 1 - first history batch (temp output only)
+        run: |
+          cp data/nba.json "$RUNNER_TEMP/nba.json"
+          python -u scripts/update_nba.py --output "$RUNNER_TEMP/nba.json"
+          python scripts/validate_data.py "$RUNNER_TEMP/nba.json"
+          python scripts/summarize_data.py "$RUNNER_TEMP/nba.json"
+      - name: Dry run 2 - resume history (temp output only)
+        run: |
+          python -u scripts/update_nba.py --output "$RUNNER_TEMP/nba.json"
+          python scripts/validate_data.py "$RUNNER_TEMP/nba.json"
+          python scripts/summarize_data.py "$RUNNER_TEMP/nba.json"

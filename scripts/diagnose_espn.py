@@ -5,6 +5,7 @@ the collector uses, so failures can be diagnosed from an Actions log.
 Writes nothing. Usage: python scripts/diagnose_espn.py
 """
 import collections
+import gzip
 import json
 import time
 import urllib.error
@@ -27,6 +28,8 @@ def probe(label, url, ua=UA):
         status, headers = e.code, dict(e.headers)
         try:
             body = e.read(2000)
+            if body[:2] == b'\x1f\x8b':  # ESPN gzips error bodies even when not asked to
+                body = gzip.decompress(body)
         except Exception:
             pass
         err = f'HTTPError {e.code} {e.reason}'

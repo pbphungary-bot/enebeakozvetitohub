@@ -1,20 +1,35 @@
 #!/usr/bin/env python3
 """Free ESPN public-data collector. No credentials. Fails closed on network errors."""
-import argparse, datetime as dt, json, os, pathlib, time, urllib.parse, urllib.request, calendar, xml.etree.ElementTree as ET
+import argparse, datetime as dt, gzip, json, os, pathlib, sys, time, urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree as ET
+from fractions import Fraction
 from concurrent.futures import ThreadPoolExecutor, as_completed
 ROOT=pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 BASE='https://site.api.espn.com/apis/site/v2/sports/basketball/nba'
 CORE='https://site.web.api.espn.com/apis/v2/sports/basketball/nba'
 HEADERS={'User-Agent':'Mozilla/5.0 (compatible; NBACommentatorCenter/1.0)','Accept':'application/json'}
+def describe_http_error(e):
+    """HTTP status plus the (possibly gzip-compressed) response body, so logs show why ESPN refused."""
+    body=b''
+    try:body=e.read(1000)
+    except Exception:pass
+    if body[:2]==b'\x1f\x8b':
+        try:body=gzip.decompress(body)
+        except Exception:pass
+    return f"HTTP {e.code} {e.reason}: {body.decode('utf-8','replace').strip()[:200]!r}"
 def get(url):
     last=None
     for attempt in range(3):
         try:
             req=urllib.request.Request(url,headers=HEADERS)
             with urllib.request.urlopen(req,timeout=18) as r: return json.load(r)
+        except urllib.error.HTTPError as e:
+            last=describe_http_error(e)
+            # A client error (e.g. 400 for an unsupported date range) is deterministic: retrying cannot help.
+            if 400<=e.code<500 and e.code not in (408,429):break
         except Exception as e:
-            last=e
-            if attempt<2: time.sleep(1+attempt)
+            last=f'{type(e).__name__}: {e}'
+        if attempt<2: time.sleep(1+attempt)
     raise RuntimeError(f'Could not fetch {url}: {last}')
 def as_list(x): return x if isinstance(x,list) else []
 def obj(x): return x if isinstance(x,dict) else {}
@@ -99,8 +114,10 @@ def standings():
             return
         if not isinstance(n,dict): return
         name=n.get('name','')
+        entries_here=as_list(obj(n.get('standings')).get('entries'))
         if 'Conference' in name: conference=name
-        if 'Division' in name: division=name
+        elif 'Division' in name: division=name
+        elif entries_here and conference: division=name  # level=3: the group that lists teams under a conference is a division
         for entry in as_list(obj(n.get('standings')).get('entries')):
             t=obj(entry.get('team'));tid=str(t.get('id',''))
             if not tid:continue
@@ -123,21 +140,24 @@ def rank_standings(entries):
     """Derive conference/division positions from actual wins and losses.
 
     ESPN's standings stat names vary; never fabricate ranks without a record.
+    Equal win percentages share a rank and are marked tied ("T-2"). These are
+    NOT official tiebreaker-aware seeds; the UI prefers ESPN's playoffSeed.
     """
     by_conf={};by_div={}
     for tid,entry in entries.items():
-        stats=entry.get('stats',{})
-        record=parse_record(stats)
+        record=parse_record(entry.get('stats',{}))
         if record is None:continue
         w,l=record
         if w+l==0: continue
-        item=(tid,w,l)
+        item=(tid,Fraction(w,w+l))
         if entry.get('conference'):by_conf.setdefault(entry['conference'],[]).append(item)
         if entry.get('division'):by_div.setdefault(entry['division'],[]).append(item)
     for field,groups in [('conferenceRank',by_conf),('divisionRank',by_div)]:
         for group in groups.values():
-            group.sort(key=lambda x:(-x[1]/(x[1]+x[2]),-x[1],x[2]))
-            for i,(tid,_,__) in enumerate(group,1):entries[tid]['stats'][field]=str(i)
+            for tid,pct in group:
+                rank=1+sum(1 for _,other in group if other>pct)
+                tied=sum(1 for _,other in group if other==pct)>1
+                entries[tid]['stats'][field]=f'T-{rank}' if tied else str(rank)
     return entries
 
 def tag_articles(articles, teams):
@@ -267,50 +287,66 @@ def news():
         if not url:continue
         result.append({'title':a.get('headline',''),'url':url,'published':a.get('published',''),'source':'ESPN','description':a.get('description',''),'teamIds':[str(t.get('id')) for t in as_list(a.get('categories')) if t.get('type')=='team' and t.get('id')]})
     return result
-def month_ranges(start, end):
-    cursor=dt.date(start.year,start.month,1)
-    while cursor<=end:
-        last=dt.date(cursor.year,cursor.month,calendar.monthrange(cursor.year,cursor.month)[1])
-        yield max(start,cursor),min(end,last)
-        cursor=last+dt.timedelta(days=1)
+def history_days(today, seasons=4):
+    """Game days (Oct 1 - Jun 30) of the last `seasons` completed seasons before the current one."""
+    season_year=today.year if today.month>=7 else today.year-1
+    days=[]
+    for year in range(season_year-seasons,season_year):
+        first,last=dt.date(year,10,1),dt.date(year+1,6,30)
+        days.extend(first+dt.timedelta(days=i) for i in range((last-first).days+1))
+    return days
 
-def historical_games(today, years=4, cached=None, refresh_months=2, cached_months=None):
-    """Fetch completed regular season/playoff games in monthly windows, not a 35-day sample.
-    If a month fails, mark history incomplete instead of presenting a false all-time count.
+def compact_game(g):
+    """Minimal stored form of a historical result; names/abbreviations are restored from the team list in the UI."""
+    return {'id':g['id'],'date':g['date'],'seasonType':g.get('seasonType',''),
+            'home':{'id':g['home']['id'],'score':g['home']['score']},'away':{'id':g['away']['id'],'score':g['away']['score']}}
+
+def history_event(event):
+    """Completed, scored, non-preseason event in compact form, or None."""
+    g=normalize_event(event)
+    if not g or not g['completed'] or g['seasonType']=='1':return None
+    if g['home']['score'] is None or g['away']['score'] is None:return None
+    return compact_game(g)
+
+def collect_history(today, seasons=4, cached=None, cached_days=None, batch=250, chunk=50, workers=5):
+    """Fetch completed games one ESPN day at a time, `batch` days per run, newest first.
+
+    ESPN rejects date-range scoreboard requests with HTTP 400, so ranges are never used.
+    A day counts as verified only after a successful response with an events list (an
+    empty list is valid). Failed days stay missing and are retried on the next run.
     """
-    if years<=0:return [],[]
-    start=dt.date(today.year-years,7,1)
-    games={str(g['id']):g for g in (cached or []) if isinstance(g,dict) and g.get('id') and g.get('date','')[:10]>=start.isoformat() and g.get('completed')};failures=[]
-    cutoff=dt.date(today.year,today.month,1)
-    for _ in range(max(0,refresh_months-1)):
-        cutoff=(cutoff-dt.timedelta(days=1)).replace(day=1)
-    # Coverage metadata alone is not proof of cached results. A missing or empty
-    # cache must never cause a month to be skipped.
-    fetched_months=set(cached_months or []) if games else set()
-    # Cache coverage is meaningful only for months within the requested window.
-    requested_months={first.strftime('%Y-%m') for first,_ in month_ranges(start,today)}
-    fetched_months.intersection_update(requested_months)
-    for first,last in month_ranges(start,today):
-        # Reuse previously collected, complete historical months. Always refresh
-        # the current and immediately preceding months for late score corrections.
-        if last<cutoff and first.strftime('%Y-%m') in fetched_months:
-            continue
-        params=urllib.parse.urlencode({'dates':first.strftime('%Y%m%d')+'-'+last.strftime('%Y%m%d'),'limit':1000})
-        try:
-            raw=get(BASE+'/scoreboard?'+params)
-            if not isinstance(raw.get('events'),list):
-                raise ValueError('scoreboard response has no events list')
-            fetched_months.add(first.strftime('%Y-%m'))
-            for e in as_list(raw.get('events')):
-                g=normalize_event(e)
-                if g and g['completed']:games[g['id']]=g
-        except Exception as exc:
-            fetched_months.discard(first.strftime('%Y-%m'))
-            failures.append(f'{first:%Y-%m}: {exc}')
-    missing=sorted(requested_months-fetched_months)
-    historical_games.last_fetched_months=sorted(fetched_months)
-    historical_games.last_missing_months=missing
-    return sorted(games.values(),key=lambda g:g['date']),failures
+    if seasons<=0:
+        return {'games':[],'daysFetched':[],'totalDays':0,'missing':[],'failures':[],'attempted':0,'start':'','end':''}
+    days=history_days(today,seasons)
+    required={d.isoformat() for d in days}
+    first=days[0].isoformat()
+    games={str(g['id']):g for g in as_list(cached) if isinstance(g,dict) and g.get('id') and str(g.get('date',''))[:10]>=first}
+    # Coverage metadata alone is not proof of cached results: without cached games, trust nothing.
+    covered=(set(cached_days or []) if games else set())&required
+    todo=sorted(required-covered,reverse=True)
+    if batch and batch>0:todo=todo[:batch]
+    def fetch(iso):
+        raw=get(BASE+'/scoreboard?'+urllib.parse.urlencode({'dates':iso.replace('-',''),'limit':100}))
+        if not isinstance(raw.get('events'),list):raise ValueError('scoreboard response missing events list')
+        return [c for e in raw['events'] if (c:=history_event(e))]
+    failures=[]
+    for i in range(0,len(todo),chunk):
+        ok=0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures={pool.submit(fetch,iso):iso for iso in todo[i:i+chunk]}
+            for future in as_completed(futures):
+                iso=futures[future]
+                try:rows=future.result()
+                except Exception as exc:
+                    failures.append(f'{iso}: {exc}');continue
+                ok+=1;covered.add(iso)
+                for c in rows:games[c['id']]=c
+        print(f'[NBA] history: {len(covered)}/{len(required)} days verified',flush=True)
+        if ok==0:
+            failures.append(f'stopped early: all {len(todo[i:i+chunk])} requests in a chunk failed');break
+    missing=sorted(required-covered)
+    return {'games':sorted(games.values(),key=lambda g:g['date']),'daysFetched':sorted(covered),'totalDays':len(required),
+            'missing':missing,'failures':failures,'attempted':len(todo),'start':first,'end':days[-1].isoformat()}
 
 def rss_news(url, source, limit=40):
     req=urllib.request.Request(url,headers=HEADERS)
@@ -323,7 +359,7 @@ def rss_news(url, source, limit=40):
             out.append({'title':val('title'),'url':link,'published':val('pubDate'),'source':source,'description':val('description'),'teamIds':[]})
     return out
 
-def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
+def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,history_batch=250):
     print("[NBA] Fetching 30 teams",flush=True)
     teams=team_list()
     if len(teams)<28:raise RuntimeError(f'Only {len(teams)} NBA teams returned; refusing incomplete output')
@@ -345,9 +381,9 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
     try: articles=news()
     except Exception as e: errors.append('news: '+str(e));articles=[]
     print("[NBA] Fetching historical scores",flush=True)
-    history,history_failures=historical_games(today,history_years,cached=obj(cached).get("history"),cached_months=obj(cached).get("historicalMonthsFetched"))
-    # ESPN's monthly scoreboard windows can silently truncate the season.
-    # Independently fetch daily scoreboards, tracking each verified day.
+    hist=collect_history(today,history_years,cached=obj(cached).get('history'),cached_days=obj(cached).get('historyDaysFetched'),batch=history_batch)
+    history=hist['games']
+    # Fetch current-season daily scoreboards, tracking each verified day.
     season_start=dt.date(today.year if today.month>=7 else today.year-1,7,1)
     print("[NBA] Fetching current season day by day",flush=True)
     season_games,season_days,season_failures,season_missing=current_season_games(
@@ -362,8 +398,8 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
     if excluded_games or excluded_history:
         errors.append(f'Excluded {len(excluded_games)} non-NBA/invalid schedule events and {len(excluded_history)} historical events (IDs: {", ".join((excluded_games+excluded_history)[:8])})')
         print(f'[NBA] Skipped {len(excluded_games)} non-NBA schedule events and {len(excluded_history)} historical events',flush=True)
-    missing_months=getattr(historical_games,'last_missing_months',[])
-    if missing_months:errors.append(f'Historical coverage incomplete: {len(missing_months)} months missing')
+    if hist['failures']:errors.append(f"Historical fetch failures this run: {len(hist['failures'])} (first: {hist['failures'][0][:240]})")
+    if hist['missing']:errors.append(f"Historical coverage incomplete: {len(hist['daysFetched'])} of {hist['totalDays']} days verified; backfilling {len(hist['missing'])} more in later runs")
     if season_failures:errors.append(f'Current-season daily fetch failures: {len(season_failures)}')
     if season_missing:errors.append(f'Current-season days not verified: {len(season_missing)}')
     if len(games)<30:raise RuntimeError('Too few games returned; refusing incomplete output')
@@ -380,9 +416,18 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None):
     errors.extend(box_errors)
     unique={a['url']:a for a in articles if a.get('url')}
     articles=tag_articles(list(unique.values()),teams)
-    return {'history':history,'historicalMonthsFetched':getattr(historical_games,'last_fetched_months',[]),'historyStart':f'{today.year-history_years}-07-01','historyComplete':not missing_months,'historyMissingMonths':missing_months,'seasonComplete':not season_missing and any(g.get('completed') for g in season_games),'seasonDaysFetched':season_days,'seasonMissingDays':season_missing,'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerStats':aggregate_player_stats(boxscores,games.values(),season_start),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysBack':days_back,'daysForward':days_forward}}
+    for t in teams:t['division']=obj(standing.get(t['id'])).get('division','')
+    from validate_data import history_sanity_problems
+    history_complete=not hist['missing']
+    if history_complete:
+        problems=history_sanity_problems(history,hist['start'],hist['end'])
+        if problems:
+            history_complete=False;errors.extend('History sanity: '+x for x in problems)
+    return {'history':history,'historyDaysFetched':hist['daysFetched'],'historyTotalDays':hist['totalDays'],'historyMissingCount':len(hist['missing']),
+        'historyStart':hist['start'],'historyEnd':hist['end'],'historyComplete':history_complete,
+        'seasonComplete':not season_missing and any(g.get('completed') for g in season_games),'seasonDaysFetched':season_days,'seasonMissingDays':season_missing,'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerStats':aggregate_player_stats(boxscores,games.values(),season_start),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysBack':days_back,'daysForward':days_forward}}
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--date',default=dt.date.today().isoformat());p.add_argument('--days-back',type=int,default=35);p.add_argument('--days-forward',type=int,default=14);p.add_argument('--history-years',type=int,default=4);p.add_argument('--output',default=str(ROOT/'data'/'nba.json'));a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--date',default=dt.date.today().isoformat());p.add_argument('--days-back',type=int,default=35);p.add_argument('--days-forward',type=int,default=14);p.add_argument('--history-years',type=int,default=4,help='completed seasons of H2H history');p.add_argument('--history-batch',type=int,default=250,help='max historical days fetched per run (0 = all)');p.add_argument('--output',default=str(ROOT/'data'/'nba.json'));a=p.parse_args()
     dest=pathlib.Path(a.output)
     cached=None
     if dest.exists():
@@ -390,7 +435,7 @@ def main():
             cached=json.loads(dest.read_text(encoding='utf-8'))
         except (ValueError,OSError):
             pass
-    result=collect(dt.date.fromisoformat(a.date),a.days_back,a.days_forward,a.history_years,cached=cached)
+    result=collect(dt.date.fromisoformat(a.date),a.days_back,a.days_forward,a.history_years,cached=cached,history_batch=a.history_batch)
     dest.parent.mkdir(parents=True,exist_ok=True)
     # Final boundary: sanitize every game, including cached and merged sources,
     # immediately before validation and publication. ESPN can return exhibition
