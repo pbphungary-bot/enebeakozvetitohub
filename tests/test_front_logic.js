@@ -5,7 +5,7 @@ const m = html.match(/\/\*LOGIC-START\*\/([\s\S]*?)\/\*LOGIC-END\*\//);
 assert(m, 'LOGIC block markers missing from index.html');
 const ctx = {};
 vm.createContext(ctx);
-vm.runInContext(m[1] + ';this.api={SEASON_TYPE,seasonTypeLabel,complete,mergeGames,formGames,regularGames,h2hFrom,h2hSplit,historyCoverage,hydrateHistory,date,dateTime,tipoff,officialRecord,confSeed,splitStat,standingsByConference,record,won}', ctx);
+vm.runInContext(m[1] + ';this.api={SEASON_TYPE,scoreOf,seasonTypeLabel,complete,mergeGames,formGames,regularGames,h2hFrom,h2hSplit,historyCoverage,hydrateHistory,date,dateTime,tipoff,officialRecord,confSeed,splitStat,standingsByConference,record,won}', ctx);
 const A = ctx.api;
 let n = 0;
 const test = (name, fn) => { fn(); n++; };
@@ -130,6 +130,17 @@ test('teams without standings land in a visible Unassigned group, last-seeded', 
 test('season type labels', () => {
   assert.strictEqual(A.seasonTypeLabel('3'), 'Playoffs');
   assert.strictEqual(A.seasonTypeLabel(''), 'Unclassified');
+});
+
+test('unplayed games show no score, even when a snapshot stored the placeholder 0', () => {
+  const sched = { status: 'STATUS_SCHEDULED', home: side('A', 0), away: side('B', 0) };
+  assert.strictEqual(A.scoreOf(sched, 'home'), '');
+  assert.strictEqual(A.scoreOf({ status: 'STATUS_SCHEDULED', home: side('A', null), away: side('B', null) }, 'away'), '');
+});
+
+test('final and in-progress games keep their scores, including a genuine 0', () => {
+  assert.strictEqual(A.scoreOf({ status: 'STATUS_FINAL', home: side('A', 101), away: side('B', 99) }, 'home'), 101);
+  assert.strictEqual(A.scoreOf({ status: 'STATUS_IN_PROGRESS', home: side('A', 0), away: side('B', 2) }, 'home'), 0);
 });
 
 console.log(`${n} front-end logic tests passed`);
