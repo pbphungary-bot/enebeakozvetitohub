@@ -1,0 +1,23 @@
+name: Diagnose ESPN (read-only)
+# Prints real HTTP status/body details for each ESPN URL shape the collector uses.
+# Read-only: no data is written or committed. Runs on manual dispatch, or when this
+# probe changes on a claude/** development branch.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['claude/**']
+    paths:
+      - 'scripts/diagnose_espn.py'
+      - '.github/workflows/diagnose-espn.yml'
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -u scripts/diagnose_espn.py
