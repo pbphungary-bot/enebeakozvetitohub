@@ -360,7 +360,7 @@ def num(x,digits=1):
 def stat_values(root_categories, categories):
     """Pair ESPN's parallel category lists: root `names` label each entry's `values` by position.
 
-    Returns {(category, split): {stat name: value}}. A root entry without `names` (the opponent
+    Returns {(category, split): {stat name: value}}; a missing splitId means '0' (own stats). A root entry without `names` (the opponent
     split) reuses the names of the earlier root category with the same name.
     """
     root=as_list(root_categories);seen={};out={}
@@ -371,7 +371,8 @@ def stat_values(root_categories, categories):
         names=as_list(r.get('names'))
         if names:seen[name]=names
         else:names=seen.get(name,[])
-        split=str(cat.get('splitId')) if cat.get('splitId') is not None else 'all'
+        # Live data: one athlete omits splitId while all others say '0'. Both mean the player's own totals.
+        split=str(cat.get('splitId')) if cat.get('splitId') is not None else '0'
         out[(name,split)]={n:v for n,v in zip(names,as_list(cat.get('values'))) if isinstance(v,(int,float)) and not isinstance(v,bool)}
     return out
 
@@ -381,16 +382,17 @@ def stats_query(season_end_year, **extra):
 
 def player_season_stats(season_end_year):
     """Official per-game season averages for every player ESPN lists, keyed by player id."""
-    out={};page=1;pages=1
+    out={};listed=0;page=1;pages=1
     while page<=pages and page<=20:
         raw=get(COMMON+'/statistics/byathlete?'+stats_query(season_end_year,isqualified='false',page=page,limit=500))
         if not isinstance(raw.get('athletes'),list):raise ValueError('player statistics response missing athletes list')
         pages=int(obj(raw.get('pagination')).get('pages') or 1)
+        listed+=len(raw['athletes'])
         for entry in raw['athletes']:
             ath=obj(entry.get('athlete'));pid=str(ath.get('id',''))
             if not pid:continue
             v=stat_values(raw.get('categories'),entry.get('categories'))
-            gen,off,dfn=v.get(('general','all'),{}),v.get(('offensive','all'),{}),v.get(('defensive','all'),{})
+            gen,off,dfn=v.get(('general','0'),{}),v.get(('offensive','0'),{}),v.get(('defensive','0'),{})
             gp=gen.get('gamesPlayed')
             if not gp:continue
             out[pid]={'teamId':str(ath.get('teamId','')),'gp':int(gp),'min':num(gen.get('avgMinutes')),'pts':num(off.get('avgPoints')),
@@ -398,6 +400,8 @@ def player_season_stats(season_end_year):
                 'tov':num(off.get('avgTurnovers')),'fgPct':num(off.get('fieldGoalPct')),'tpPct':num(off.get('threePointFieldGoalPct')),'ftPct':num(off.get('freeThrowPct'))}
         page+=1
     if not out:raise ValueError('no player statistics returned')
+    # A format change must be loud: parsing a small fraction of the listed players is a failure, not a result.
+    if len(out)<listed*0.5:raise ValueError(f'parsed only {len(out)} of {listed} listed players; response format may have changed')
     return out
 
 def possessions(o):

@@ -49,6 +49,29 @@ class PlayerSeasonTests(unittest.TestCase):
         out, _ = self.run_stats([entry])
         self.assertIsNone(out['1']['blk'])
         self.assertEqual(out['1']['stl'], 1.0)
+    def test_players_parse_whether_or_not_splitid_is_present(self):
+        # Exact live failure: ESPN's first athlete has no splitId, the other 472 have "0".
+        first = player('1')
+        rest = []
+        for pid in ('2', '3'):
+            e = player(pid)
+            for c in e['categories']:
+                c['splitId'] = '0'
+            rest.append(e)
+        out, _ = self.run_stats([first] + rest)
+        self.assertEqual(sorted(out), ['1', '2', '3'])
+        self.assertEqual(out['2']['pts'], out['1']['pts'])
+    def test_parsing_a_small_fraction_of_listed_players_is_an_error(self):
+        broken = [player(str(i)) for i in range(10)]
+        for e in broken[1:]:
+            e['categories'] = [{'name': 'general', 'splitId': 'unexpected', 'values': [15.0, 36.4, 8.7]}]  # format drift
+        with patch.object(m, 'get', return_value={'pagination': {'pages': 1}, 'categories': PLAYER_ROOT, 'athletes': broken}):
+            with self.assertRaises(ValueError) as cm:
+                m.player_season_stats(2027)
+        self.assertIn('parsed only 1 of 10', str(cm.exception))
+    def test_a_few_players_without_games_do_not_trip_the_guard(self):
+        out, _ = self.run_stats([player(str(i), gp=(0.0 if i < 2 else 5.0)) for i in range(10)])
+        self.assertEqual(len(out), 8)
     def test_every_page_is_requested(self):
         with patch.object(m, 'get', side_effect=lambda u: {'pagination': {'pages': 2}, 'categories': PLAYER_ROOT, 'athletes': [player('a' if 'page=1' in u else 'b')]}) as g:
             out = m.player_season_stats(2027)
@@ -117,7 +140,7 @@ class StatValuesTests(unittest.TestCase):
         self.assertEqual(v[('x', '0')], {'a': 1, 'b': 2}); self.assertEqual(v[('x', '900')], {'a': 3, 'b': 4})
     def test_non_numeric_values_are_dropped(self):
         v = m.stat_values([{'name': 'x', 'names': ['a', 'b', 'c']}], [{'name': 'x', 'values': [1, None, True]}])
-        self.assertEqual(v[('x', 'all')], {'a': 1})
+        self.assertEqual(v[('x', '0')], {'a': 1})
     def test_num_never_turns_missing_into_zero(self):
         self.assertIsNone(m.num(None)); self.assertIsNone(m.num('3')); self.assertIsNone(m.num(True)); self.assertEqual(m.num(0), 0.0)
 
