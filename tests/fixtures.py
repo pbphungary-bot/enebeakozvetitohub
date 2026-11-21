@@ -14,6 +14,7 @@ def valid_data(now=None):
     return {'teams': teams, 'games': games, 'standings': standings,
             'rosters': {str(i): [{'id': 'p'}] for i in range(1, 31)},
             'seasonComplete': True, 'seasonStart': '2026-07-01', 'generatedAt': (now - dt.timedelta(hours=1)).isoformat(),
+            'playerSeason': {}, 'teamStats': {}, 'injuries': {}, 'injuriesAsOf': '',
             'history': [], 'historyComplete': False, 'historyTotalDays': 1093, 'historyMissingCount': 1093,
             'historyDaysFetched': [], 'historyStart': '2022-10-01', 'historyEnd': '2026-06-30'}
 

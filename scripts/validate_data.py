@@ -89,6 +89,25 @@ def record_reconciliation_problems(data, tolerance=1):
     return problems
 
 
+def season_stats_problems(data, team_ids):
+    """Season stats and injuries may be empty (their sources can fail independently) but must be well-formed."""
+    problems = []
+    known = set(team_ids)
+    for key in ('playerSeason', 'teamStats', 'injuries'):
+        if not isinstance(data.get(key), dict):
+            problems.append(f'{key} missing or malformed')
+    team_stats = data.get('teamStats') if isinstance(data.get('teamStats'), dict) else {}
+    if team_stats and len(team_stats) < 28:
+        problems.append(f'Team statistics cover only {len(team_stats)} teams')
+    for tid in list(team_stats) + list(data.get('injuries') if isinstance(data.get('injuries'), dict) else {}):
+        if tid not in known:
+            problems.append(f'Statistics or injuries reference unknown team {tid}')
+    for tid, rows in (data.get('injuries') if isinstance(data.get('injuries'), dict) else {}).items():
+        if not isinstance(rows, list) or any(not isinstance(r, dict) or not r.get('name') or not r.get('status') for r in rows):
+            problems.append(f'Malformed injury rows for team {tid}')
+    return problems
+
+
 def history_problems(data):
     """Historical coverage may be partial, but it must never be claimed complete falsely."""
     problems = []
@@ -159,6 +178,7 @@ def validate(data, now=None):
             except (ValueError, TypeError):
                 errors.append('Invalid current-season coverage metadata')
     errors.extend(history_problems(data))
+    errors.extend(season_stats_problems(data, ids))
     errors.extend(record_reconciliation_problems(data))
     return errors
 

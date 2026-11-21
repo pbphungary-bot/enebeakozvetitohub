@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'scripts'))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import update_nba as m
+import test_p1_stats as p1
 from validate_data import validate
 
 TODAY = dt.date(2026, 11, 20)
@@ -26,6 +28,7 @@ class FakeEspn:
     """Serves single-day scoreboards only; date ranges answer 400 like the real API."""
     def __init__(self):
         self.calls = []
+        self.stats_down = False
         self.days = {}
         self.wins = {i: 0 for i in IDS}
         self.losses = {i: 0 for i in IDS}
@@ -63,6 +66,14 @@ class FakeEspn:
                 divs = [{'name': f'{name[:1]}-Div{n}', 'standings': {'entries': [team_entry(i, ids.index(i) + 1) for i in ids[5 * n:5 * n + 5]]}} for n in range(3)]
                 return {'name': f'{name} Conference', 'children': divs}
             return {'name': 'NBA', 'children': [conference('East', IDS[:15]), conference('West', IDS[15:])]}
+        if '/statistics/' in url:
+            if self.stats_down:
+                raise RuntimeError(f'Could not fetch {url}: HTTP 500')
+            if 'byathlete' in url:
+                return {'pagination': {'pages': 1}, 'categories': p1.PLAYER_ROOT, 'athletes': [p1.player('p' + i, team=i) for i in IDS]}
+            return {'categories': p1.TEAM_ROOT, 'teams': [p1.team_entry(i, p1.OWN, p1.OPP) for i in IDS]}
+        if url.endswith('/injuries'):
+            return {'timestamp': '2026-11-20T10:00:00Z', 'injuries': [{'id': i, 'displayName': f'Team {i}', 'injuries': ([{'status': 'Out', 'date': '2026-11-20T09:00Z', 'shortComment': 'Out.', 'athlete': {'id': 'p' + i, 'displayName': 'Player ' + i}, 'details': {'type': 'Knee'}}] if i == '1' else [])} for i in IDS]}
         if '/roster' in url:
             tid = url.split('/teams/')[1].split('/')[0]
             return {'athletes': [{'id': 'p' + tid, 'displayName': 'Player ' + tid}]}
@@ -128,6 +139,31 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(data['historyMissingCount'], 0)
         self.assertFalse(data['historyComplete'])
         self.assertTrue(any('History sanity' in w for w in data['warnings']))
+        self.assertEqual(validate(data), [])
+
+    def test_season_stats_team_stats_and_injuries_are_collected(self):
+        data = run(self.out, FakeEspn(), '--history-batch', '1')
+        self.assertEqual(len(data['playerSeason']), 30)
+        self.assertEqual(data['playerSeason']['p7']['pts'], 37.2)
+        self.assertEqual(len(data['teamStats']), 30)
+        self.assertEqual(data['teamStats']['7']['ppg'], 122.1)
+        self.assertEqual(data['injuries']['1'][0]['name'], 'Player 1')
+        self.assertEqual(data['injuries']['2'], [])
+        self.assertEqual(data['injuriesAsOf'], '2026-11-20T10:00:00Z')
+        self.assertEqual(validate(data), [])
+    def test_stats_outage_keeps_last_good_values_and_still_publishes(self):
+        run(self.out, FakeEspn(), '--history-batch', '1')
+        down = FakeEspn(); down.stats_down = True
+        data = run(self.out, down, '--history-batch', '1')
+        self.assertEqual(len(data['playerSeason']), 30)  # cached, not wiped
+        self.assertEqual(len(data['teamStats']), 30)
+        self.assertTrue(any('Player season stats: cached after fetch failure' in w for w in data['warnings']))
+        self.assertEqual(validate(data), [])
+    def test_stats_outage_on_first_run_publishes_empty_not_invented_values(self):
+        down = FakeEspn(); down.stats_down = True
+        data = run(self.out, down, '--history-batch', '1')
+        self.assertEqual((data['playerSeason'], data['teamStats']), ({}, {}))
+        self.assertTrue(any('Team statistics: unavailable' in w for w in data['warnings']))
         self.assertEqual(validate(data), [])
 
 
