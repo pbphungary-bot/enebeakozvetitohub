@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Free ESPN public-data collector. No credentials. Fails closed on network errors."""
-import argparse, datetime as dt, gzip, json, os, pathlib, sys, time, urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree as ET
+import argparse, datetime as dt, gzip, html, json, os, pathlib, re, sys, time, urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree as ET
 from fractions import Fraction
 from concurrent.futures import ThreadPoolExecutor, as_completed
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 BASE='https://site.api.espn.com/apis/site/v2/sports/basketball/nba'
 CORE='https://site.web.api.espn.com/apis/v2/sports/basketball/nba'
+COMMON='https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba'
 HEADERS={'User-Agent':'Mozilla/5.0 (compatible; NBACommentatorCenter/1.0)','Accept':'application/json'}
 def describe_http_error(e):
     """HTTP status plus the (possibly gzip-compressed) response body, so logs show why ESPN refused."""
@@ -42,7 +43,11 @@ def normalize_event(e):
     def team(x):
         t=obj(x.get('team'));return {'id':str(t.get('id','')),'name':t.get('displayName',''),'abbr':t.get('abbreviation',''),'logo':t.get('logo',''),'score':int(x['score']) if str(x.get('score','')).isdigit() else None,'record':obj(as_list(x.get('records'))[0] if x.get('records') else {}).get('summary','')}
     status=obj(e.get('status'));typ=obj(status.get('type'))
-    return {'id':str(e.get('id','')),'date':e.get('date',''),'status':typ.get('name',''),'completed':bool(typ.get('completed')),'detail':typ.get('shortDetail',''),'seasonType':str(obj(e.get('season')).get('type') or obj(e.get('seasonType')).get('type') or obj(obj(as_list(e.get('competitions'))[0] if e.get('competitions') else {}).get('type')).get('id') or ''), 'home':team(cs['home']),'away':team(cs['away'])}
+    game={'id':str(e.get('id','')),'date':e.get('date',''),'status':typ.get('name',''),'completed':bool(typ.get('completed')),'detail':typ.get('shortDetail',''),'seasonType':str(obj(e.get('season')).get('type') or obj(e.get('seasonType')).get('type') or obj(obj(as_list(e.get('competitions'))[0] if e.get('competitions') else {}).get('type')).get('id') or ''), 'home':team(cs['home']),'away':team(cs['away'])}
+    if game['status']=='STATUS_SCHEDULED':
+        # ESPN reports "0" for games not yet played; that is not a score.
+        game['home']['score']=game['away']['score']=None
+    return game
 def filter_nba_games(games, teams):
     """Exclude ESPN exhibition/placeholder opponents not in the NBA team list.
 
@@ -162,6 +167,7 @@ def rank_standings(entries):
 
 def tag_articles(articles, teams):
     """Tag unlabelled RSS articles using exact team names and distinctive nicknames."""
+    valid={str(t['id']) for t in teams}
     nicknames={}
     for t in teams:
         nick=t['name'].split()[-1].lower()
@@ -175,7 +181,7 @@ def tag_articles(articles, teams):
             if len(nicknames[nick])==1 and len(nick)>3:
                 import re
                 if re.search(r'(?<![a-z])'+re.escape(nick)+r'(?![a-z])',text):ids.add(t['id'])
-        a['teamIds']=sorted(ids)
+        a['teamIds']=sorted(i for i in ids if i in valid)  # drop non-NBA (college/WNBA) team tags
     return articles
 
 def roster(team_id):
@@ -248,35 +254,19 @@ def collect_boxscores(games, cached=None, max_games=25):
             errors.append(f'Box score {gid} unavailable: {exc}')
     return result,errors
 
-def aggregate_player_stats(boxscores, games, season_start):
-    """Summarize only actually cached current-season box-score rows.
+def clean_text(value):
+    """Decode HTML entities (feeds sometimes double-encode), drop tags and collapse whitespace."""
+    text=html.unescape(html.unescape(str(value or '')))
+    return re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',text)).strip()
 
-    This is explicitly not an official full-season average: coverage can be sparse.
-    """
-    eligible={str(g['id']):g for g in games if g.get('completed') and str(g.get('date',''))[:10]>=season_start.isoformat()}
-    accum={}
-    for gid,rows in obj(boxscores).items():
-        game=eligible.get(str(gid))
-        if not game:continue
-        for row in as_list(rows):
-            labels=[str(x).upper() for x in as_list(row.get('labels'))]
-            values=as_list(row.get('stats'))
-            if not row.get('id') or not labels or not values:continue
-            team_name=row.get('team','')
-            side=next((x for x in ('home','away') if game[x].get('name')==team_name),None)
-            if side is None:continue
-            tid=str(game[side]['id']); pid=str(row['id'])
-            extracted={}
-            for field,aliases in [('pts',('PTS','POINTS')),('reb',('REB','REBOUNDS')),('ast',('AST','ASSISTS'))]:
-                idx=next((labels.index(a) for a in aliases if a in labels),None)
-                if idx is not None and idx<len(values):
-                    try:extracted[field]=float(values[idx])
-                    except (TypeError,ValueError):pass
-            if not extracted:continue
-            item=accum.setdefault(tid,{}).setdefault(pid,{'games':0,'totals':{'pts':0.,'reb':0.,'ast':0.},'counts':{'pts':0,'reb':0,'ast':0}})
-            item['games']+=1
-            for k,v in extracted.items():item['totals'][k]+=v;item['counts'][k]+=1
-    return {tid:{pid:{'games':v['games'],**{k:round(v['totals'][k]/v['counts'][k],1) if v['counts'][k] else None for k in ('pts','reb','ast')}} for pid,v in players.items()} for tid,players in accum.items()}
+def article_team_ids(categories):
+    """Team tags carry the NBA team id in `teamId` (their own `id` is an ESPN category id, not a team id)."""
+    ids=[]
+    for c in as_list(categories):
+        if not isinstance(c,dict) or c.get('type')!='team':continue
+        tid=c.get('teamId') or obj(c.get('team')).get('id')
+        if tid:ids.append(str(tid))
+    return ids
 
 def news():
     raw=get(BASE+'/news?limit=100')
@@ -285,7 +275,7 @@ def news():
         links=obj(a.get('links'));web=obj(links.get('web'))
         url=web.get('href','')
         if not url:continue
-        result.append({'title':a.get('headline',''),'url':url,'published':a.get('published',''),'source':'ESPN','description':a.get('description',''),'teamIds':[str(t.get('id')) for t in as_list(a.get('categories')) if t.get('type')=='team' and t.get('id')]})
+        result.append({'title':clean_text(a.get('headline','')),'url':url,'published':a.get('published',''),'source':'ESPN','description':clean_text(a.get('description','')),'teamIds':article_team_ids(a.get('categories'))})
     return result
 def history_days(today, seasons=4):
     """Game days (Oct 1 - Jun 30) of the last `seasons` completed seasons before the current one."""
@@ -348,6 +338,9 @@ def collect_history(today, seasons=4, cached=None, cached_days=None, batch=250, 
     return {'games':sorted(games.values(),key=lambda g:g['date']),'daysFetched':sorted(covered),'totalDays':len(required),
             'missing':missing,'failures':failures,'attempted':len(todo),'start':first,'end':days[-1].isoformat()}
 
+# Verified live: ESPN's RSS answers 202 with an empty body, NBA.com's returns 404, HoopsHype blocks bots.
+RSS_FEEDS=[('https://www.cbssports.com/rss/headlines/nba/','CBS Sports'),('https://sports.yahoo.com/nba/rss/','Yahoo Sports')]
+
 def rss_news(url, source, limit=40):
     req=urllib.request.Request(url,headers=HEADERS)
     with urllib.request.urlopen(req,timeout=18) as response:root=ET.fromstring(response.read(3_000_000))
@@ -356,8 +349,131 @@ def rss_news(url, source, limit=40):
         val=lambda name:(item.findtext(name) or '').strip()
         link=val('link')
         if link.startswith('https://'):
-            out.append({'title':val('title'),'url':link,'published':val('pubDate'),'source':source,'description':val('description'),'teamIds':[]})
+            out.append({'title':clean_text(val('title')),'url':link,'published':val('pubDate'),'source':source,'description':clean_text(val('description')),'teamIds':[]})
     return out
+
+# ---- P1: official season statistics, team statistics and injuries -------------------------------
+def num(x,digits=1):
+    """Round a real number; anything else (None, text, bool) is unavailable, never zero."""
+    return round(float(x),digits) if isinstance(x,(int,float)) and not isinstance(x,bool) else None
+
+def stat_values(root_categories, categories):
+    """Pair ESPN's parallel category lists: root `names` label each entry's `values` by position.
+
+    Returns {(category, split): {stat name: value}}; a missing splitId means '0' (own stats). A root entry without `names` (the opponent
+    split) reuses the names of the earlier root category with the same name.
+    """
+    root=as_list(root_categories);seen={};out={}
+    for i,cat in enumerate(as_list(categories)):
+        if not isinstance(cat,dict):continue
+        r=obj(root[i]) if i<len(root) else {}
+        name=cat.get('name') or r.get('name')
+        names=as_list(r.get('names'))
+        if names:seen[name]=names
+        else:names=seen.get(name,[])
+        # Live data: one athlete omits splitId while all others say '0'. Both mean the player's own totals.
+        split=str(cat.get('splitId')) if cat.get('splitId') is not None else '0'
+        out[(name,split)]={n:v for n,v in zip(names,as_list(cat.get('values'))) if isinstance(v,(int,float)) and not isinstance(v,bool)}
+    return out
+
+def stats_query(season_end_year, **extra):
+    q={'region':'us','lang':'en','contentorigin':'espn','sort':'offensive.avgPoints:desc','season':season_end_year,'seasontype':2}
+    q.update(extra);return urllib.parse.urlencode(q)
+
+def player_season_stats(season_end_year):
+    """Official per-game season averages for every player ESPN lists, keyed by player id."""
+    out={};listed=0;page=1;pages=1
+    while page<=pages and page<=20:
+        raw=get(COMMON+'/statistics/byathlete?'+stats_query(season_end_year,isqualified='false',page=page,limit=500))
+        if not isinstance(raw.get('athletes'),list):raise ValueError('player statistics response missing athletes list')
+        pages=int(obj(raw.get('pagination')).get('pages') or 1)
+        listed+=len(raw['athletes'])
+        for entry in raw['athletes']:
+            ath=obj(entry.get('athlete'));pid=str(ath.get('id',''))
+            if not pid:continue
+            v=stat_values(raw.get('categories'),entry.get('categories'))
+            gen,off,dfn=v.get(('general','0'),{}),v.get(('offensive','0'),{}),v.get(('defensive','0'),{})
+            gp=gen.get('gamesPlayed')
+            if not gp:continue
+            out[pid]={'teamId':str(ath.get('teamId','')),'gp':int(gp),'min':num(gen.get('avgMinutes')),'pts':num(off.get('avgPoints')),
+                'reb':num(gen.get('avgRebounds')),'ast':num(off.get('avgAssists')),'stl':num(dfn.get('avgSteals')),'blk':num(dfn.get('avgBlocks')),
+                'tov':num(off.get('avgTurnovers')),'fgPct':num(off.get('fieldGoalPct')),'tpPct':num(off.get('threePointFieldGoalPct')),'ftPct':num(off.get('freeThrowPct'))}
+        page+=1
+    if not out:raise ValueError('no player statistics returned')
+    # A format change must be loud: parsing a small fraction of the listed players is a failure, not a result.
+    if len(out)<listed*0.5:raise ValueError(f'parsed only {len(out)} of {listed} listed players; response format may have changed')
+    return out
+
+def possessions(o):
+    """Per-game possession estimate FGA - OREB + TO + 0.44 FTA from per-game averages (None if any input is missing)."""
+    parts=[o.get(k) for k in ('avgFieldGoalsAttempted','avgOffensiveRebounds','avgTurnovers','avgFreeThrowsAttempted')]
+    if any(x is None for x in parts):return None
+    fga,oreb,tov,fta=parts
+    return fga-oreb+tov+0.44*fta
+
+def team_season_stats(season_end_year):
+    """Per-game team and opponent averages, plus estimated pace and ratings, keyed by team id.
+
+    Pace and ratings are ESTIMATES from box-score averages (the two teams' possession estimates are
+    averaged), not official tracking values; the UI labels them as such.
+    """
+    raw=get(COMMON+'/statistics/byteam?'+stats_query(season_end_year))
+    entries=as_list(raw.get('teams'))
+    if not entries:raise ValueError('team statistics response has no teams')
+    out={}
+    for entry in entries:
+        tid=str(obj(entry.get('team')).get('id',''))
+        if not tid:continue
+        v=stat_values(raw.get('categories'),entry.get('categories'))
+        gen,off,dfn=v.get(('general','0'),{}),v.get(('offensive','0'),{}),v.get(('defensive','0'),{})
+        opp=v.get(('offensive','900'),{})
+        ppg,opp_ppg=off.get('avgPoints'),opp.get('avgPoints')
+        mine,theirs=possessions(off),possessions(opp)
+        poss=(mine+theirs)/2 if mine is not None and theirs is not None else None
+        pace=num(poss);ortg=num(100*ppg/poss) if poss and ppg is not None else None;drtg=num(100*opp_ppg/poss) if poss and opp_ppg is not None else None
+        out[tid]={'gp':int(gen['gamesPlayed']) if gen.get('gamesPlayed') else None,'ppg':num(ppg),'oppPpg':num(opp_ppg),
+            'diff':num(ppg-opp_ppg) if ppg is not None and opp_ppg is not None else None,
+            'fgPct':num(off.get('fieldGoalPct')),'tpPct':num(off.get('threePointFieldGoalPct')),'ftPct':num(off.get('freeThrowPct')),
+            'oppFgPct':num(opp.get('fieldGoalPct')),'oppTpPct':num(opp.get('threePointFieldGoalPct')),
+            'reb':num(gen.get('avgRebounds')),'oreb':num(off.get('avgOffensiveRebounds')),'dreb':num(dfn.get('avgDefensiveRebounds')),
+            'ast':num(off.get('avgAssists')),'tov':num(off.get('avgTurnovers')),'stl':num(dfn.get('avgSteals')),'blk':num(dfn.get('avgBlocks')),
+            'pace':pace,'ortg':ortg,'drtg':drtg,'net':num(ortg-drtg) if ortg is not None and drtg is not None else None}
+    if not out:raise ValueError('no team statistics returned')
+    return out
+
+def injury_player_id(athlete):
+    if athlete.get('id'):return str(athlete['id'])
+    for link in as_list(athlete.get('links')):
+        match=re.search(r'/id/(\d+)',str(obj(link).get('href','')))
+        if match:return match.group(1)
+    return ''
+
+def injury_report():
+    """League injury report by team id: (report, ESPN's timestamp). An empty team list is valid."""
+    raw=get(BASE+'/injuries')
+    groups=raw.get('injuries')
+    if not isinstance(groups,list):raise ValueError('injury response missing injuries list')
+    report={}
+    for group in groups:
+        tid=str(obj(group).get('id',''))
+        if not tid:continue
+        rows=[]
+        for item in as_list(group.get('injuries')):
+            ath=obj(item.get('athlete'));det=obj(item.get('details'))
+            name=ath.get('displayName','')
+            if not name:continue
+            rows.append({'playerId':injury_player_id(ath),'name':name,'position':obj(ath.get('position')).get('abbreviation',''),
+                'status':item.get('status',''),'injury':' '.join(x for x in (det.get('side'),det.get('type'),det.get('detail')) if x),
+                'returnDate':det.get('returnDate',''),'date':item.get('date',''),'comment':clean_text(item.get('shortComment',''))[:300]})
+        report[tid]=rows
+    return report,str(raw.get('timestamp',''))
+
+def refresh_cached(label, fetch, cached, errors):
+    """Run an optional collector stage; on failure keep the last good value and say so."""
+    try:return fetch()
+    except Exception as exc:
+        errors.append(f'{label}: {"cached after fetch failure" if cached else "unavailable"} ({exc})'[:300])
+        return None
 
 def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,history_batch=250):
     print("[NBA] Fetching 30 teams",flush=True)
@@ -405,15 +521,22 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,histo
     if len(games)<30:raise RuntimeError('Too few games returned; refusing incomplete output')
     if not any(g.get('completed') for g in season_games):
         errors.append('No current-season completed games in daily collection')
-    try: articles+=rss_news('https://www.espn.com/espn/rss/nba/news','ESPN RSS')
-    except Exception as exc:errors.append('ESPN RSS: '+str(exc))
-    try: articles+=rss_news('https://www.nba.com/rss/nba_rss.xml','NBA.com')
-    except Exception as exc:errors.append('NBA.com RSS: '+str(exc))
+    for feed_url,feed_name in RSS_FEEDS:
+        try:
+            got=rss_news(feed_url,feed_name)
+            if not got:raise ValueError('feed returned no articles')
+            articles+=got
+        except Exception as exc:errors.append(f'{feed_name} RSS: {exc}')
     print("[NBA] Fetching rosters and player box scores",flush=True)
     rosters,roster_errors=collect_rosters(teams,obj(cached).get('rosters'))
     errors.extend(roster_errors)
     boxscores,box_errors=collect_boxscores(games.values(),obj(cached).get('boxscores'))
     errors.extend(box_errors)
+    end_year=today.year+1 if today.month>=7 else today.year  # ESPN labels 2026-27 as 2027
+    cache=obj(cached)
+    player_season=refresh_cached('Player season stats',lambda:player_season_stats(end_year),cache.get('playerSeason'),errors)
+    team_stats=refresh_cached('Team statistics',lambda:team_season_stats(end_year),cache.get('teamStats'),errors)
+    injured=refresh_cached('Injury report',injury_report,cache.get('injuries'),errors)
     unique={a['url']:a for a in articles if a.get('url')}
     articles=tag_articles(list(unique.values()),teams)
     for t in teams:t['division']=obj(standing.get(t['id'])).get('division','')
@@ -425,7 +548,7 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,histo
             history_complete=False;errors.extend('History sanity: '+x for x in problems)
     return {'history':history,'historyDaysFetched':hist['daysFetched'],'historyTotalDays':hist['totalDays'],'historyMissingCount':len(hist['missing']),
         'historyStart':hist['start'],'historyEnd':hist['end'],'historyComplete':history_complete,
-        'seasonComplete':not season_missing and any(g.get('completed') for g in season_games),'seasonDaysFetched':season_days,'seasonMissingDays':season_missing,'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerStats':aggregate_player_stats(boxscores,games.values(),season_start),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysBack':days_back,'daysForward':days_forward}}
+        'seasonComplete':not season_missing and any(g.get('completed') for g in season_games),'seasonDaysFetched':season_days,'seasonMissingDays':season_missing,'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerSeason':player_season if player_season is not None else obj(cache.get('playerSeason')),'teamStats':team_stats if team_stats is not None else obj(cache.get('teamStats')),'injuries':injured[0] if injured else obj(cache.get('injuries')),'injuriesAsOf':injured[1] if injured else cache.get('injuriesAsOf',''),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysBack':days_back,'daysForward':days_forward}}
 def main():
     p=argparse.ArgumentParser();p.add_argument('--date',default=dt.date.today().isoformat());p.add_argument('--days-back',type=int,default=35);p.add_argument('--days-forward',type=int,default=14);p.add_argument('--history-years',type=int,default=4,help='completed seasons of H2H history');p.add_argument('--history-batch',type=int,default=250,help='max historical days fetched per run (0 = all)');p.add_argument('--output',default=str(ROOT/'data'/'nba.json'));a=p.parse_args()
     dest=pathlib.Path(a.output)

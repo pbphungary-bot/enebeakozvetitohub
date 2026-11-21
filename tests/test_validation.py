@@ -80,5 +80,28 @@ class DataValidationTests(unittest.TestCase):
         data = sample(); data['historyTotalDays'] = 0
         self.assertTrue(any('coverage metadata missing' in e for e in validate(data, NOW)))
 
+    # --- P1: season statistics and injuries
+    def test_missing_stats_keys_are_rejected(self):
+        data = sample(); del data['teamStats']
+        self.assertTrue(any('teamStats missing or malformed' in e for e in validate(data, NOW)))
+    def test_empty_stats_are_allowed_so_one_failed_source_cannot_block_publication(self):
+        data = sample(); data.update(playerSeason={}, teamStats={}, injuries={})
+        self.assertEqual(validate(data, NOW), [])
+    def test_partial_team_stats_are_rejected(self):
+        data = sample(); data['teamStats'] = {str(i): {'ppg': 100.0} for i in range(1, 11)}
+        self.assertTrue(any('cover only 10 teams' in e for e in validate(data, NOW)))
+    def test_full_team_stats_pass(self):
+        data = sample(); data['teamStats'] = {str(i): {'ppg': 100.0} for i in range(1, 31)}
+        self.assertEqual(validate(data, NOW), [])
+    def test_unknown_team_in_injuries_is_rejected(self):
+        data = sample(); data['injuries'] = {'999': []}
+        self.assertTrue(any('unknown team 999' in e for e in validate(data, NOW)))
+    def test_malformed_injury_rows_are_rejected(self):
+        data = sample(); data['injuries'] = {'1': [{'name': 'A Player'}]}  # no status
+        self.assertTrue(any('Malformed injury rows for team 1' in e for e in validate(data, NOW)))
+    def test_valid_injuries_pass(self):
+        data = sample(); data['injuries'] = {'1': [{'name': 'A Player', 'status': 'Out'}], '2': []}
+        self.assertEqual(validate(data, NOW), [])
+
 
 if __name__ == '__main__': unittest.main()

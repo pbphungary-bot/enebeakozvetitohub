@@ -5,7 +5,7 @@ const m = html.match(/\/\*LOGIC-START\*\/([\s\S]*?)\/\*LOGIC-END\*\//);
 assert(m, 'LOGIC block markers missing from index.html');
 const ctx = {};
 vm.createContext(ctx);
-vm.runInContext(m[1] + ';this.api={SEASON_TYPE,seasonTypeLabel,complete,mergeGames,formGames,regularGames,h2hFrom,h2hSplit,historyCoverage,hydrateHistory,date,dateTime,tipoff,officialRecord,confSeed,splitStat,standingsByConference,record,won}', ctx);
+vm.runInContext(m[1] + ';this.api={teamInjuries,injuryState,injuryClass,dateOnly,compareRows,SEASON_TYPE,scoreOf,seasonTypeLabel,complete,mergeGames,formGames,regularGames,h2hFrom,h2hSplit,historyCoverage,hydrateHistory,date,dateTime,tipoff,officialRecord,confSeed,splitStat,standingsByConference,record,won}', ctx);
 const A = ctx.api;
 let n = 0;
 const test = (name, fn) => { fn(); n++; };
@@ -130,6 +130,85 @@ test('teams without standings land in a visible Unassigned group, last-seeded', 
 test('season type labels', () => {
   assert.strictEqual(A.seasonTypeLabel('3'), 'Playoffs');
   assert.strictEqual(A.seasonTypeLabel(''), 'Unclassified');
+});
+
+test('unplayed games show no score, even when a snapshot stored the placeholder 0', () => {
+  const sched = { status: 'STATUS_SCHEDULED', home: side('A', 0), away: side('B', 0) };
+  assert.strictEqual(A.scoreOf(sched, 'home'), '');
+  assert.strictEqual(A.scoreOf({ status: 'STATUS_SCHEDULED', home: side('A', null), away: side('B', null) }, 'away'), '');
+});
+
+test('final and in-progress games keep their scores, including a genuine 0', () => {
+  assert.strictEqual(A.scoreOf({ status: 'STATUS_FINAL', home: side('A', 101), away: side('B', 99) }, 'home'), 101);
+  assert.strictEqual(A.scoreOf({ status: 'STATUS_IN_PROGRESS', home: side('A', 0), away: side('B', 2) }, 'home'), 0);
+});
+
+// ---- P1: injuries and team comparison
+test('injuries list the most severe first, then by name, and unknown statuses last', () => {
+  const data = { injuries: { '1': [
+    { name: 'Zed', status: 'Day-To-Day' }, { name: 'Amy', status: 'Out' }, { name: 'Bob', status: 'Out' }, { name: 'Cy', status: 'Weird' }, { name: 'Dee', status: 'Questionable' }] } };
+  assert.deepStrictEqual(Array.from(A.teamInjuries(data, '1'), r => r.name), ['Amy', 'Bob', 'Dee', 'Zed', 'Cy']);
+  assert.deepStrictEqual(Array.from(A.teamInjuries(data, '2')), []);
+  assert.deepStrictEqual(Array.from(A.teamInjuries(undefined, '1')), []);
+});
+
+test('injury list is not mutated by sorting', () => {
+  const rows = [{ name: 'B', status: 'Out' }, { name: 'A', status: 'Out' }];
+  A.teamInjuries({ injuries: { '1': rows } }, '1');
+  assert.strictEqual(rows[0].name, 'B');
+});
+
+test('injury report availability and staleness are explicit', () => {
+  assert.strictEqual(A.injuryState({ injuries: {} }).available, false);
+  assert.strictEqual(A.injuryState({}).available, false);
+  assert.strictEqual(A.injuryState(undefined).available, false);
+  const fresh = A.injuryState({ injuries: { '1': [] }, injuriesAsOf: '2026-11-21T20:00:00Z', generatedAt: '2026-11-21T22:00:00Z' });
+  assert.deepStrictEqual([fresh.available, fresh.ageHours, fresh.stale], [true, 2, false]);
+  const stale = A.injuryState({ injuries: { '1': [] }, injuriesAsOf: '2026-11-21T10:00:00Z', generatedAt: '2026-11-21T22:00:00Z' });
+  assert.deepStrictEqual([stale.ageHours, stale.stale], [12, true]);
+  const unknown = A.injuryState({ injuries: { '1': [] }, injuriesAsOf: 'garbage', generatedAt: '2026-11-21T22:00:00Z' });
+  assert.deepStrictEqual([unknown.ageHours, unknown.stale], [null, false]);
+});
+
+test('an empty list for a team is a valid report (available), not a missing one', () => {
+  assert.strictEqual(A.injuryState({ injuries: { '1': [], '2': [] } }).available, true);
+});
+
+test('injury status styling: Out is severe, everything else a warning', () => {
+  assert.strictEqual(A.injuryClass('Out'), 'loss');
+  assert.strictEqual(A.injuryClass('Day-To-Day'), 'warn');
+});
+
+test('return dates are calendar dates and never shift across time zones', () => {
+  assert.strictEqual(A.dateOnly('2026-11-22'), 'Nov 22, 2026');
+  assert.strictEqual(A.dateOnly('2027-07-01'), 'Jul 1, 2027');
+  assert.strictEqual(A.dateOnly(''), '');
+  assert.strictEqual(A.dateOnly('2026-11-22T10:00Z'), '');
+});
+
+test('comparison highlights the better value per row, in the right direction', () => {
+  const rows = A.compareRows({ ppg: 122.1, oppPpg: 111.9, diff: 10.2, pace: 99.5, tov: 15 }, { ppg: 110.0, oppPpg: 105.0, diff: 5.0, pace: 97.0, tov: 12 });
+  const by = label => rows.flatMap(s => s.rows).find(r => r.label === label);
+  assert.deepStrictEqual([by('Points per game').aBetter, by('Points per game').bBetter], [true, false]);
+  assert.deepStrictEqual([by('Opponent points per game').aBetter, by('Opponent points per game').bBetter], [false, true]); // lower is better
+  assert.deepStrictEqual([by('Turnovers').aBetter, by('Turnovers').bBetter], [false, true]);
+  assert.deepStrictEqual([by('Pace (est.)').aBetter, by('Pace (est.)').bBetter], [false, false]); // pace is neutral
+});
+
+test('comparison shows signed differentials and dashes for missing values, with no highlight', () => {
+  const rows = A.compareRows({ diff: 10.2, net: -3.1 }, { diff: -4.0, ppg: 100 });
+  const by = label => rows.flatMap(s => s.rows).find(r => r.label === label);
+  assert.deepStrictEqual([by('Point differential').a, by('Point differential').b], ['+10.2', '-4']);
+  assert.strictEqual(by('Net rating (est.)').a, '-3.1');
+  assert.deepStrictEqual([by('Points per game').a, by('Points per game').b], ['—', '100']);
+  assert.deepStrictEqual([by('Points per game').aBetter, by('Points per game').bBetter], [false, false]);
+});
+
+test('equal values highlight neither team and a missing team does not crash', () => {
+  const rows = A.compareRows({ ppg: 100 }, { ppg: 100 });
+  assert.deepStrictEqual([rows[0].rows[0].aBetter, rows[0].rows[0].bBetter], [false, false]);
+  assert.strictEqual(A.compareRows(undefined, undefined).length, 4);
+  assert.strictEqual(A.compareRows(undefined, { ppg: 100 })[0].rows[0].a, '—');
 });
 
 console.log(`${n} front-end logic tests passed`);
