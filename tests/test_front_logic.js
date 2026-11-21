@@ -5,7 +5,7 @@ const m = html.match(/\/\*LOGIC-START\*\/([\s\S]*?)\/\*LOGIC-END\*\//);
 assert(m, 'LOGIC block markers missing from index.html');
 const ctx = {};
 vm.createContext(ctx);
-vm.runInContext(m[1] + ';this.api={boxTeams,parseBoxscore,splitNotices,teamInjuries,injuryState,injuryClass,dateOnly,compareRows,SEASON_TYPE,scoreOf,seasonTypeLabel,complete,mergeGames,formGames,regularGames,h2hFrom,h2hSplit,historyCoverage,hydrateHistory,date,dateTime,tipoff,officialRecord,confSeed,splitStat,standingsByConference,record,won}', ctx);
+vm.runInContext(m[1] + ';this.api={cleanInjury,seasonLabel,buildStorylines,restInfo,nextMeeting,rankOf,leadersBy,streakInfo,ordinal,etDay,boxTeams,parseBoxscore,splitNotices,teamInjuries,injuryState,injuryClass,dateOnly,compareRows,SEASON_TYPE,scoreOf,seasonTypeLabel,complete,mergeGames,formGames,regularGames,h2hFrom,h2hSplit,historyCoverage,hydrateHistory,date,dateTime,tipoff,officialRecord,confSeed,splitStat,standingsByConference,record,won}', ctx);
 const A = ctx.api;
 let n = 0;
 const test = (name, fn) => { fn(); n++; };
@@ -236,6 +236,224 @@ test('only core-data failures are prominent; everything else is a collapsed data
   assert.deepStrictEqual(Array.from(n.critical), ['standings: HTTP 500', 'Current-season days not verified: 2', 'Upcoming fixture request failures: 3', 'ATL roster unavailable: x']);
   assert.strictEqual(n.info.length, 4);
   assert.deepStrictEqual([A.splitNotices(undefined).critical.length, A.splitNotices([]).info.length, A.splitNotices([null, '']).info.length], [0, 0, 0]);
+});
+
+// ---- P2.1 storylines
+const TEAMS2 = [{ id: '1', name: 'New York Knicks', abbr: 'NYK' }, { id: '2', name: 'Minnesota Timberwolves', abbr: 'MIN' }];
+const mkg = (id, dateIso, h, a, hs, as, type = '2', completed = true, status = completed ? 'STATUS_FINAL' : 'STATUS_SCHEDULED') =>
+  ({ id, date: dateIso, seasonType: type, completed, status, home: { id: h, score: completed ? hs : null }, away: { id: a, score: completed ? as : null } });
+const baseCtx = (over = {}) => ({
+  home: '1', away: '2', teams: TEAMS2, games: [], h2h: [], seasonStart: '2026-07-01', asOf: '2026-11-21T12:00Z', seasonComplete: true,
+  standings: { '1': { conference: 'Eastern Conference', division: 'Atlantic', stats: { wins: '9', losses: '6', playoffSeed: '6', streak: 'W2', Home: '4-3' } },
+               '2': { conference: 'Western Conference', division: 'Northwest', stats: { wins: '11', losses: '5', playoffSeed: '5', streak: 'L1', Road: '4-2' } } },
+  ...over });
+const lines = (c, group) => Array.from(A.buildStorylines(c)).filter(x => !group || x.group === group).map(x => x.text);
+const has = (arr, re) => arr.some(t => re.test(t));
+
+test('storylines: standings context and relation', () => {
+  const t = lines(baseCtx(), 'Matchup');
+  assert.strictEqual(t[0], 'NYK 9–6 (6th seed, Eastern Conference) vs MIN 11–5 (5th seed, Western Conference).');
+  assert.strictEqual(t[1], 'Interconference matchup.');
+  const rivals = baseCtx(); rivals.standings['2'] = { conference: 'Eastern Conference', division: 'Atlantic', stats: { wins: '1', losses: '1' } };
+  assert.strictEqual(lines(rivals, 'Matchup')[1], 'Division rivals (Atlantic).');
+  rivals.standings['2'].division = 'Central';
+  assert.strictEqual(lines(rivals, 'Matchup')[1], 'Conference matchup.');
+});
+
+test('storylines: nothing is invented when standings are missing', () => {
+  assert.deepStrictEqual(lines(baseCtx({ standings: {} }), 'Matchup'), []);
+});
+
+test('storylines: season series, last meeting with ET date, winner, score and venue', () => {
+  const h2h = [mkg('b', '2026-11-21T00:30Z', '2', '1', 108, 99), mkg('a', '2026-11-02T01:00Z', '1', '2', 112, 100)]; // newest first
+  const t = lines(baseCtx({ h2h }), 'Head to head');
+  assert.strictEqual(t[0], 'Season series tied 1–1.');
+  assert.strictEqual(t[1], 'Last meeting Nov 20, 2026: MIN won 108–99 at MIN.'); // 00:30Z is still Nov 20 in New York
+  const lead = lines(baseCtx({ h2h: [h2h[1]] }), 'Head to head');
+  assert.strictEqual(lead[0], 'Season series: NYK lead 1–0.');
+});
+
+test('storylines: "no meetings yet" only when the current season is fully collected', () => {
+  assert.ok(has(lines(baseCtx(), 'Head to head'), /No meetings yet this season/));
+  assert.ok(!has(lines(baseCtx({ seasonComplete: false }), 'Head to head'), /No meetings yet/));
+});
+
+test('storylines: previous seasons are not mistaken for this season\'s series', () => {
+  const old = [mkg('x', '2025-01-10T00:00Z', '1', '2', 100, 90)];
+  const t = lines(baseCtx({ h2h: old }), 'Head to head');
+  assert.ok(has(t, /No meetings yet this season/)); assert.ok(!has(t, /Season series/));
+});
+
+test('storylines: next meeting appears only for a scheduled game between the two teams', () => {
+  const sched = mkg('n', '2026-11-29T01:00Z', '2', '1', 0, 0, '2', false);
+  assert.ok(has(lines(baseCtx({ games: [sched] }), 'Head to head'), /^Next meeting: Nov 28, 2026, 8:00 PM EST, NYK at MIN\.$/));
+  assert.ok(!has(lines(baseCtx({ games: [mkg('o', '2026-11-29T01:00Z', '2', '3', 0, 0, '2', false)] }), 'Head to head'), /Next meeting/));
+  assert.ok(!has(lines(baseCtx({ games: [mkg('p', '2026-11-01T01:00Z', '2', '1', 0, 0, '2', false)] }), 'Head to head'), /Next meeting/)); // in the past
+});
+
+test('storylines: multi-season record needs a verified-complete history', () => {
+  const h2h = [mkg('1', '2025-12-01T00:00Z', '1', '2', 120, 90), mkg('2', '2025-05-01T00:00Z', '2', '1', 100, 99, '3'), mkg('3', '2024-12-01T00:00Z', '1', '2', 100, 101)];
+  assert.ok(!has(lines(baseCtx({ h2h }), 'Head to head'), /Since/));
+  assert.ok(!has(lines(baseCtx({ h2h, historyComplete: false }), 'Head to head'), /Since/));
+  const t = lines(baseCtx({ h2h, historyComplete: true, historyStart: '2022-10-01' }), 'Head to head');
+  assert.ok(t.includes('Since the 2022–23 season: NYK 1–2 in 3 meetings, including 1 playoff game (NYK 0–1).'), t.join(' | '));
+  assert.ok(has(t, /^Largest margin in the window: NYK by 30 on Nov 30, 2025\.$/));
+});
+
+test('storylines: streaks only from three games', () => {
+  const t = c => lines(c, 'Form').filter(x => /straight/.test(x));
+  assert.deepStrictEqual(t(baseCtx()), []);
+  const c = baseCtx(); c.standings['1'].stats.streak = 'W4'; c.standings['2'].stats.streak = 'L5';
+  assert.deepStrictEqual(t(c), ['NYK have won 4 straight.', 'MIN have lost 5 straight.']);
+});
+
+test('storylines: last-10 line needs five games and reports record, points and margin', () => {
+  const g = [];
+  for (let i = 0; i < 6; i++) g.push(mkg('g' + i, `2026-11-${String(10 + i).padStart(2, '0')}T01:00Z`, '1', '9', i < 4 ? 110 : 100, i < 4 ? 100 : 105));
+  const t = lines(baseCtx({ games: g }), 'Form');
+  assert.ok(t.includes('NYK are 4–2 in their last 6, averaging 106.7 points (+5.0 per game).'), t.join(' | '));
+  assert.ok(!has(lines(baseCtx({ games: g.slice(0, 4) }), 'Form'), /last/));
+});
+
+test('storylines: preseason games never feed form lines', () => {
+  const g = []; for (let i = 0; i < 6; i++) g.push(mkg('p' + i, `2026-10-0${i + 1}T01:00Z`, '1', '9', 100, 90, '1'));
+  assert.ok(!has(lines(baseCtx({ games: g }), 'Form'), /last/));
+});
+
+test('storylines: home and road records need both official splits', () => {
+  assert.ok(has(lines(baseCtx(), 'Form'), /^NYK are 4–3 at home; MIN are 4–2 on the road\.$/));
+  const c = baseCtx(); delete c.standings['2'].stats.Road;
+  assert.ok(!has(lines(c, 'Form'), /at home/));
+});
+
+test('rest: back-to-back and rest days are counted in New York days', () => {
+  const games = [mkg('r1', '2026-11-21T00:30Z', '1', '9', 100, 90)]; // played Nov 20 ET
+  assert.deepStrictEqual(Object.assign({}, A.restInfo(games, '1', '2026-11-22T01:00Z')), { restDays: 0, lastDay: '2026-11-20', last7: 1 });
+  assert.strictEqual(A.restInfo(games, '1', '2026-11-22T01:00Z').restDays, 0);   // plays Nov 21 ET: back-to-back
+  assert.strictEqual(A.restInfo(games, '1', '2026-11-24T01:00Z').restDays, 2);   // plays Nov 23 ET: the 21st and 22nd are free
+  assert.strictEqual(A.restInfo(games, '2', '2026-11-24T01:00Z'), null);          // never played
+});
+
+test('rest: games after the reference or in preseason do not count', () => {
+  const games = [mkg('a', '2026-11-30T01:00Z', '1', '9', 1, 0), mkg('b', '2026-10-05T01:00Z', '1', '9', 1, 0, '1')];
+  assert.strictEqual(A.restInfo(games, '1', '2026-11-22T01:00Z'), null);
+});
+
+test('storylines: rest lines appear only when a meeting is scheduled', () => {
+  const sched = mkg('n', '2026-11-22T01:00Z', '2', '1', 0, 0, '2', false);
+  const prior = [mkg('p1', '2026-11-21T00:30Z', '1', '9', 100, 90), mkg('p2', '2026-11-17T01:00Z', '2', '8', 100, 90)];
+  const t = lines(baseCtx({ games: [sched, ...prior] }), 'Rest & schedule');
+  assert.deepStrictEqual(t, ['NYK will be on a back-to-back.', 'MIN will have 4 days of rest.']);
+  assert.deepStrictEqual(lines(baseCtx({ games: prior }), 'Rest & schedule'), []);
+});
+
+const league = (fn) => Object.fromEntries(Array.from({ length: 30 }, (_, i) => [String(i + 1), fn(i + 1)]));
+test('rank: 1 is best, direction respected, and needs a (nearly) full league', () => {
+  const ts = league(i => ({ ppg: 100 + i, oppPpg: 100 + i }));
+  assert.strictEqual(A.rankOf(ts, 'ppg', '30', 'high'), 1);
+  assert.strictEqual(A.rankOf(ts, 'oppPpg', '1', 'low'), 1);
+  assert.strictEqual(A.rankOf(ts, 'ppg', '1', 'high'), 30);
+  assert.strictEqual(A.rankOf({ '1': { ppg: 1 } }, 'ppg', '1', 'high'), null);
+  assert.strictEqual(A.rankOf(ts, 'missing', '1', 'high'), null);
+});
+
+test('storylines: strengths and pace clash are shown only when notable', () => {
+  const ts = league(i => ({ ppg: 100 + i, oppPpg: 100 + i, pace: 90 + i }));
+  const t = lines(baseCtx({ teamStats: ts }), 'Team strengths');
+  // team 1 is the worst offence (30th) and best defence (1st); team 2 is 29th offence / 2nd defence
+  assert.ok(has(t, /^NYK: offense 30th \(101 ppg\), defense 1st \(101 allowed\)\.$/), t.join(' | '));
+  assert.ok(has(t, /^MIN: offense 29th \(102 ppg\), defense 2nd \(102 allowed\)\.$/), t.join(' | '));
+  assert.ok(!has(lines(baseCtx({ teamStats: league(i => ({ ppg: 100 + i, oppPpg: 100 + (i % 15) + 7, pace: 100 })) }), 'Team strengths'), /Pace clash/));
+  const clash = lines(baseCtx({ teamStats: league(i => ({ ppg: 110, oppPpg: 110, pace: i === 1 ? 105 : i === 2 ? 95 : 100 })) }), 'Team strengths');
+  assert.ok(has(clash, /^Pace clash: NYK 1st in pace \(105\) vs MIN 30th \(95\), estimated\.$/), clash.join(' | '));
+});
+
+test('storylines: mid-table teams generate no strength lines', () => {
+  const ts = league(i => ({ ppg: 100 + i, oppPpg: 100 + i, pace: 100 }));
+  ts['1'] = { ppg: 115, oppPpg: 115, pace: 100 }; ts['2'] = { ppg: 114, oppPpg: 114, pace: 100 };
+  assert.deepStrictEqual(lines(baseCtx({ teamStats: ts }), 'Team strengths'), []);
+});
+
+test('leaders: ranked per stat, ignoring players with too few games or missing values', () => {
+  const roster = [{ id: 'a', name: 'Ann' }, { id: 'b', name: 'Bo' }, { id: 'c', name: 'Cy' }, { id: 'd', name: 'Di' }];
+  const ps = { a: { gp: 10, pts: 20 }, b: { gp: 10, pts: 25 }, c: { gp: 2, pts: 40 }, d: { gp: 9 } };
+  assert.deepStrictEqual(Array.from(A.leadersBy(ps, roster, 'pts'), r => r.name), ['Bo', 'Ann']);
+  assert.deepStrictEqual(Array.from(A.leadersBy(undefined, roster, 'pts')), []);
+});
+
+const roster1 = [{ id: 'p1', name: 'Jalen Brunson' }, { id: 'p2', name: 'Karl-Anthony Towns' }, { id: 'p3', name: 'Josh Hart' }, { id: 'p4', name: 'Bench Guy' }];
+const ps1 = { p1: { gp: 15, pts: 27.3, reb: 3.1, ast: 7.4 }, p2: { gp: 15, pts: 21.0, reb: 12.2, ast: 3.0 }, p3: { gp: 15, pts: 11.0, reb: 8.1, ast: 4.2 }, p4: { gp: 15, pts: 2.0, reb: 1.0, ast: 0.5 } };
+
+test('storylines: team leaders by points, rebounds and assists', () => {
+  const t = lines(baseCtx({ rosters: { '1': roster1 }, playerSeason: ps1 }), 'Players');
+  assert.deepStrictEqual(t, ['NYK leaders: Jalen Brunson 27.3 pts, Karl-Anthony Towns 12.2 reb, Jalen Brunson 7.4 ast.']);
+});
+
+test('storylines: availability names a top-3 scorer who is out, doubtful or day-to-day', () => {
+  const c = baseCtx({ rosters: { '1': roster1 }, playerSeason: ps1, injuries: { '1': [
+    { playerId: 'p1', name: 'Jalen Brunson', status: 'Out', injury: 'Right Ankle Sprain' },
+    { name: 'Karl-Anthony Towns', status: 'Day-To-Day', injury: 'Knee' },       // matched by name
+    { playerId: 'p4', name: 'Bench Guy', status: 'Out', injury: 'Back' }] } });  // not a top-3 scorer
+  const t = lines(c, 'Availability');
+  assert.deepStrictEqual(t, ["NYK's leading scorer Jalen Brunson (27.3 ppg) is out (right ankle sprain).", "NYK's 2nd-leading scorer Karl-Anthony Towns (21.0 ppg) is day-to-day (knee)."]);
+});
+
+test('storylines: three or more players out is called out; two is not', () => {
+  const mk = n => baseCtx({ injuries: { '2': Array.from({ length: n }, (_, i) => ({ name: 'P' + i, status: 'Out' })) } });
+  assert.deepStrictEqual(lines(mk(3), 'Availability'), ['MIN have 3 players listed out.']);
+  assert.deepStrictEqual(lines(mk(2), 'Availability'), []);
+});
+
+test('storylines: no injury line for a healthy or questionable-only roster', () => {
+  const c = baseCtx({ rosters: { '1': roster1 }, playerSeason: ps1, injuries: { '1': [{ playerId: 'p1', name: 'Jalen Brunson', status: 'Questionable' }] } });
+  assert.deepStrictEqual(lines(c, 'Availability'), []);
+});
+
+test('storylines: degenerate input yields no lines and never throws', () => {
+  assert.deepStrictEqual(Array.from(A.buildStorylines({})), []);
+  assert.deepStrictEqual(Array.from(A.buildStorylines({ home: '1', away: '1', teams: TEAMS2 })), []);
+  assert.doesNotThrow(() => A.buildStorylines({ home: '1', away: '2' }));
+  assert.doesNotThrow(() => A.buildStorylines(baseCtx({ standings: undefined, teamStats: null, playerSeason: null, rosters: null, injuries: null })));
+});
+
+test('storylines: no line ever contains undefined, NaN or null', () => {
+  const g = []; for (let i = 0; i < 8; i++) g.push(mkg('s' + i, `2026-11-${String(5 + i).padStart(2, '0')}T01:00Z`, '1', '2', 100 + i, 99));
+  const c = baseCtx({ games: [...g, mkg('n', '2026-11-29T01:00Z', '2', '1', 0, 0, '2', false)], h2h: g.slice().reverse(), historyComplete: true, historyStart: '2022-10-01',
+    teamStats: league(i => ({ ppg: 100 + i, oppPpg: 100 + i, pace: 100 + i })), rosters: { '1': roster1 }, playerSeason: ps1, injuries: { '1': [{ playerId: 'p1', name: 'Jalen Brunson', status: 'Out' }] } });
+  const all = lines(c);
+  assert.ok(all.length >= 8, all.length);
+  for (const line of all) assert.ok(typeof line === 'string' && line.length > 5 && !/undefined|NaN|null|\[object/.test(line), line);
+});
+
+test('helpers: ordinals, streak parsing and New York calendar days', () => {
+  assert.deepStrictEqual([1, 2, 3, 4, 11, 12, 13, 21, 22, 30].map(A.ordinal), ['1st', '2nd', '3rd', '4th', '11th', '12th', '13th', '21st', '22nd', '30th']);
+  assert.deepStrictEqual([A.streakInfo({ streak: 'W4' }).n, A.streakInfo({ streak: 'L12' }).type, A.streakInfo({ streak: '' }), A.streakInfo(undefined)], [4, 'L', null, null]);
+  assert.strictEqual(A.etDay('2026-11-21T00:30Z'), '2026-11-20');
+  assert.strictEqual(A.etDay('garbage'), '');
+});
+
+test('numbers keep one decimal, so whole values do not lose their .0', () => {
+  const roster = [{ id: 'a', name: 'Ann' }];
+  const t = lines(baseCtx({ rosters: { '1': roster }, playerSeason: { a: { gp: 9, pts: 20, reb: 7, ast: 5.5 } } }), 'Players');
+  assert.deepStrictEqual(t, ['NYK leaders: Ann 20.0 pts, Ann 7.0 reb, Ann 5.5 ast.']);
+});
+
+test('ESPN\'s "Not Specified" injury placeholder is never shown', () => {
+  assert.strictEqual(A.cleanInjury('Left Hamstring Not Specified'), 'Left Hamstring');
+  assert.strictEqual(A.cleanInjury('Not Specified'), '');
+  assert.strictEqual(A.cleanInjury('Right Knee Surgery'), 'Right Knee Surgery');
+  assert.strictEqual(A.cleanInjury(undefined), '');
+  const c = baseCtx({ rosters: { '1': roster1 }, playerSeason: ps1, injuries: { '1': [{ playerId: 'p2', name: 'Karl-Anthony Towns', status: 'Out', injury: 'Left Hamstring Not Specified' }] } });
+  assert.deepStrictEqual(lines(c, 'Availability'), ["NYK's 2nd-leading scorer Karl-Anthony Towns (21.0 ppg) is out (left hamstring)."]);
+  const bare = baseCtx({ rosters: { '1': roster1 }, playerSeason: ps1, injuries: { '1': [{ playerId: 'p2', name: 'Karl-Anthony Towns', status: 'Out', injury: 'Not Specified' }] } });
+  assert.deepStrictEqual(lines(bare, 'Availability'), ["NYK's 2nd-leading scorer Karl-Anthony Towns (21.0 ppg) is out."]);
+});
+
+test('season labels', () => {
+  assert.strictEqual(A.seasonLabel('2022-10-01'), 'the 2022–23 season');
+  assert.strictEqual(A.seasonLabel('1999-10-01'), 'the 1999–00 season');
+  assert.strictEqual(A.seasonLabel(''), 'the start of the window');
+  assert.strictEqual(A.seasonLabel(undefined), 'the start of the window');
 });
 
 console.log(`${n} front-end logic tests passed`);

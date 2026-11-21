@@ -160,6 +160,10 @@ class InjuryTests(unittest.TestCase):
         self.assertEqual(r['playerId'], '5149077')  # athlete id is taken from the profile link
         self.assertEqual(r['comment'], 'Flemings (back) is out & questionable.')
         self.assertEqual(ts, '2026-11-21T22:14:37Z')
+    def test_not_specified_placeholder_is_dropped_from_the_injury_text(self):
+        row = dict(self.ROW, details={'type': 'Hamstring', 'side': 'Left', 'detail': 'Not Specified', 'returnDate': '2026-12-01'})
+        rep, _ = self.report([{'id': '1', 'injuries': [row]}])
+        self.assertEqual(rep['1'][0]['injury'], 'Left Hamstring')
     def test_team_without_injuries_is_a_valid_empty_list(self):
         rep, _ = self.report([{'id': '2', 'injuries': []}])
         self.assertEqual(rep, {'2': []})

@@ -492,7 +492,7 @@ def injury_report():
             name=ath.get('displayName','')
             if not name:continue
             rows.append({'playerId':injury_player_id(ath),'name':name,'position':obj(ath.get('position')).get('abbreviation',''),
-                'status':item.get('status',''),'injury':' '.join(x for x in (det.get('side'),det.get('type'),det.get('detail')) if x),
+                'status':item.get('status',''),'injury':' '.join(x for x in (det.get('side'),det.get('type'),det.get('detail')) if x and str(x).strip().lower()!='not specified'),
                 'returnDate':det.get('returnDate',''),'date':item.get('date',''),'comment':clean_text(item.get('shortComment',''))[:300]})
         report[tid]=rows
     return report,str(raw.get('timestamp',''))

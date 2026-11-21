@@ -43,7 +43,7 @@ window.fetch=async()=>({ok:true,json:async()=>JSON.parse(DATA_JSON)});
         page.locator('[data-page="standings"]').click()
         assert page.locator('tbody tr').count()==30
         page.locator('[data-page="matchup"]').click()
-        page.locator('textarea[data-note="home"]').fill('Test note saved')
+        page.locator('textarea[data-note="1"]').fill('Test note saved')
         assert page.evaluate("localStorage.getItem('nba-notes:1:2')") is not None
         assert not errors,errors
         print('PASS: Chromium: 30 teams, matchup, schedule, standings, notes persistence; no JS errors')
