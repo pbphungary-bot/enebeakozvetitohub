@@ -23,7 +23,7 @@ def main():
         shapes[tuple((c.get('name'), len(c.get('values') or [])) for c in cats)] += 1
         pid = str(ath.get('id', ''))
         v = m.stat_values(raw.get('categories'), cats)
-        gen = v.get(('general', 'all'), {})
+        gen = v.get(('general', '0'), {})
         reasons['no id' if not pid else 'no general.gamesPlayed' if not gen.get('gamesPlayed') else 'ok'] += 1
     print('reasons', dict(reasons))
     print('category shapes (name,len(values)) -> count:')
