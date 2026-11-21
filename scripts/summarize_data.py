@@ -24,6 +24,25 @@ def main(path):
     print('sample standings stats keys:', sorted((sample.get('stats') or {}).keys()))
     print('division ranks sample:', [v['stats'].get('divisionRank') for v in list(st.values())[:8]])
     print('game seasonTypes:', dict(collections.Counter(g.get('seasonType') for g in d.get('games', []))))
+    print('--- P1 coverage')
+    roster_ids = {p['id'] for rows in d.get('rosters', {}).values() for p in rows}
+    season = d.get('playerSeason', {})
+    print(f"playerSeason: {len(season)} players; rostered players with season stats: {len(roster_ids & set(season))} of {len(roster_ids)}")
+    sample = next(iter(season.items()), None)
+    print('  sample player:', sample)
+    ts = d.get('teamStats', {})
+    blanks = {k: sum(1 for v in ts.values() if v.get(k) is None) for k in (next(iter(ts.values())).keys() if ts else [])}
+    print(f"teamStats: {len(ts)} teams; teams missing each field: { {k: n for k, n in blanks.items() if n} or 'none' }")
+    print('  sample team:', next(iter(ts.items()), None))
+    inj = d.get('injuries', {})
+    print(f"injuries: {sum(len(v) for v in inj.values())} players across {len(inj)} teams; asOf={d.get('injuriesAsOf')}")
+    news = d.get('news', [])
+    team_ids = {t['id'] for t in d.get('teams', [])}
+    tagged = [a for a in news if a.get('teamIds')]
+    bad = [a for a in tagged if not set(a['teamIds']) <= team_ids]
+    print(f"news: {len(news)} articles, {len(tagged)} team-tagged, {len(bad)} with an invalid team id; sources={dict(collections.Counter(a.get('source') for a in news))}")
+    print('  sample tagged:', next(((a['title'][:70], a['teamIds']) for a in tagged), None))
+    print('  sample title decoded (no entities):', not any('&#' in a.get('title', '') or '&amp;' in a.get('title', '') for a in news))
     print('warnings:')
     for w in d.get('warnings', []):
         print('  -', w[:400])
