@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Free ESPN public-data collector. No credentials. Fails closed on network errors."""
-import argparse, datetime as dt, gzip, json, os, pathlib, sys, time, urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree as ET
+import argparse, datetime as dt, gzip, html, json, os, pathlib, re, sys, time, urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree as ET
 from fractions import Fraction
 from concurrent.futures import ThreadPoolExecutor, as_completed
 ROOT=pathlib.Path(__file__).resolve().parents[1]
@@ -166,6 +166,7 @@ def rank_standings(entries):
 
 def tag_articles(articles, teams):
     """Tag unlabelled RSS articles using exact team names and distinctive nicknames."""
+    valid={str(t['id']) for t in teams}
     nicknames={}
     for t in teams:
         nick=t['name'].split()[-1].lower()
@@ -179,7 +180,7 @@ def tag_articles(articles, teams):
             if len(nicknames[nick])==1 and len(nick)>3:
                 import re
                 if re.search(r'(?<![a-z])'+re.escape(nick)+r'(?![a-z])',text):ids.add(t['id'])
-        a['teamIds']=sorted(ids)
+        a['teamIds']=sorted(i for i in ids if i in valid)  # drop non-NBA (college/WNBA) team tags
     return articles
 
 def roster(team_id):
@@ -282,6 +283,20 @@ def aggregate_player_stats(boxscores, games, season_start):
             for k,v in extracted.items():item['totals'][k]+=v;item['counts'][k]+=1
     return {tid:{pid:{'games':v['games'],**{k:round(v['totals'][k]/v['counts'][k],1) if v['counts'][k] else None for k in ('pts','reb','ast')}} for pid,v in players.items()} for tid,players in accum.items()}
 
+def clean_text(value):
+    """Decode HTML entities (feeds sometimes double-encode), drop tags and collapse whitespace."""
+    text=html.unescape(html.unescape(str(value or '')))
+    return re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',text)).strip()
+
+def article_team_ids(categories):
+    """Team tags carry the NBA team id in `teamId` (their own `id` is an ESPN category id, not a team id)."""
+    ids=[]
+    for c in as_list(categories):
+        if not isinstance(c,dict) or c.get('type')!='team':continue
+        tid=c.get('teamId') or obj(c.get('team')).get('id')
+        if tid:ids.append(str(tid))
+    return ids
+
 def news():
     raw=get(BASE+'/news?limit=100')
     result=[]
@@ -289,7 +304,7 @@ def news():
         links=obj(a.get('links'));web=obj(links.get('web'))
         url=web.get('href','')
         if not url:continue
-        result.append({'title':a.get('headline',''),'url':url,'published':a.get('published',''),'source':'ESPN','description':a.get('description',''),'teamIds':[str(t.get('id')) for t in as_list(a.get('categories')) if t.get('type')=='team' and t.get('id')]})
+        result.append({'title':clean_text(a.get('headline','')),'url':url,'published':a.get('published',''),'source':'ESPN','description':clean_text(a.get('description','')),'teamIds':article_team_ids(a.get('categories'))})
     return result
 def history_days(today, seasons=4):
     """Game days (Oct 1 - Jun 30) of the last `seasons` completed seasons before the current one."""
@@ -352,6 +367,9 @@ def collect_history(today, seasons=4, cached=None, cached_days=None, batch=250, 
     return {'games':sorted(games.values(),key=lambda g:g['date']),'daysFetched':sorted(covered),'totalDays':len(required),
             'missing':missing,'failures':failures,'attempted':len(todo),'start':first,'end':days[-1].isoformat()}
 
+# Verified live: ESPN's RSS answers 202 with an empty body, NBA.com's returns 404, HoopsHype blocks bots.
+RSS_FEEDS=[('https://www.cbssports.com/rss/headlines/nba/','CBS Sports'),('https://sports.yahoo.com/nba/rss/','Yahoo Sports')]
+
 def rss_news(url, source, limit=40):
     req=urllib.request.Request(url,headers=HEADERS)
     with urllib.request.urlopen(req,timeout=18) as response:root=ET.fromstring(response.read(3_000_000))
@@ -360,7 +378,7 @@ def rss_news(url, source, limit=40):
         val=lambda name:(item.findtext(name) or '').strip()
         link=val('link')
         if link.startswith('https://'):
-            out.append({'title':val('title'),'url':link,'published':val('pubDate'),'source':source,'description':val('description'),'teamIds':[]})
+            out.append({'title':clean_text(val('title')),'url':link,'published':val('pubDate'),'source':source,'description':clean_text(val('description')),'teamIds':[]})
     return out
 
 def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,history_batch=250):
@@ -409,10 +427,12 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,histo
     if len(games)<30:raise RuntimeError('Too few games returned; refusing incomplete output')
     if not any(g.get('completed') for g in season_games):
         errors.append('No current-season completed games in daily collection')
-    try: articles+=rss_news('https://www.espn.com/espn/rss/nba/news','ESPN RSS')
-    except Exception as exc:errors.append('ESPN RSS: '+str(exc))
-    try: articles+=rss_news('https://www.nba.com/rss/nba_rss.xml','NBA.com')
-    except Exception as exc:errors.append('NBA.com RSS: '+str(exc))
+    for feed_url,feed_name in RSS_FEEDS:
+        try:
+            got=rss_news(feed_url,feed_name)
+            if not got:raise ValueError('feed returned no articles')
+            articles+=got
+        except Exception as exc:errors.append(f'{feed_name} RSS: {exc}')
     print("[NBA] Fetching rosters and player box scores",flush=True)
     rosters,roster_errors=collect_rosters(teams,obj(cached).get('rosters'))
     errors.extend(roster_errors)
