@@ -26,6 +26,8 @@ jobs:
         run: python -u scripts/probe_p1.py
       - name: Probe P1 stat labels and injury fields
         run: python -u scripts/probe_p1b.py
+      - name: Probe player stats parsing
+        run: python -u scripts/probe_p1c.py
       - name: Dry run 1 - first history batch (temp output only)
         run: |
           cp data/nba.json "$RUNNER_TEMP/nba.json"
