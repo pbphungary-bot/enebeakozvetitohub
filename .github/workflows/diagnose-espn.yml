@@ -22,6 +22,8 @@ jobs:
           python-version: '3.12'
       - name: Probe ESPN URL shapes
         run: python -u scripts/diagnose_espn.py
+      - name: Probe P1 endpoints (stats, injuries, team stats, news)
+        run: python -u scripts/probe_p1.py
       - name: Dry run 1 - first history batch (temp output only)
         run: |
           cp data/nba.json "$RUNNER_TEMP/nba.json"
