@@ -78,7 +78,7 @@ class FakeEspn:
             tid = url.split('/teams/')[1].split('/')[0]
             return {'athletes': [{'id': 'p' + tid, 'displayName': 'Player ' + tid}]}
         if '/summary' in url:
-            return {'boxscore': {'players': []}}
+            return {'boxscore': {'players': [{'team': {'displayName': 'Team'}, 'statistics': [{'labels': ['MIN', 'PTS'], 'athletes': [{'athlete': {'id': 'x', 'displayName': 'X'}, 'stats': ['30', '20']}]}]}]}}
         if '/news' in url:
             return {'articles': []}
         raise AssertionError('unexpected url ' + url)
@@ -165,6 +165,19 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual((data['playerSeason'], data['teamStats']), ({}, {}))
         self.assertTrue(any('Team statistics: unavailable' in w for w in data['warnings']))
         self.assertEqual(validate(data), [])
+
+    def test_box_scores_are_bounded_per_team_and_use_the_compact_shape(self):
+        fake = FakeEspn()
+        data = run(self.out, fake, '--history-batch', '1')
+        self.assertTrue(data['boxscores'])
+        self.assertLessEqual(len(data['boxscores']), 30 * 10)
+        box = next(iter(data['boxscores'].values()))
+        self.assertEqual(box['teams'][0]['labels'], ['MIN', 'PTS'])
+        # a second run must not refetch what is already cached
+        second = FakeEspn(); run(self.out, second, '--history-batch', '1')
+        fetched_first = {u for u in fake.calls if '/summary' in u}
+        self.assertTrue(fetched_first)
+        self.assertEqual([u for u in second.calls if '/summary' in u and u in fetched_first], [])
 
 
 if __name__ == '__main__': unittest.main()

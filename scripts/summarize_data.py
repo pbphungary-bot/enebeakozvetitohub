@@ -43,6 +43,17 @@ def main(path):
     print(f"news: {len(news)} articles, {len(tagged)} team-tagged, {len(bad)} with an invalid team id; sources={dict(collections.Counter(a.get('source') for a in news))}")
     print('  sample tagged:', next(((a['title'][:70], a['teamIds']) for a in tagged), None))
     print('  sample title decoded (no entities):', not any('&#' in a.get('title', '') or '&amp;' in a.get('title', '') for a in news))
+    boxes = d.get('boxscores', {})
+    size_kb = len(json.dumps(boxes, separators=(',', ':'))) / 1024
+    per_team = collections.Counter()
+    games_by_id = {g['id']: g for g in d.get('games', [])}
+    for gid in boxes:
+        g = games_by_id.get(gid)
+        if g:
+            per_team[g['home']['id']] += 1
+            per_team[g['away']['id']] += 1
+    print(f"boxscores: {len(boxes)} games, {size_kb:.0f} KB; max games kept for one team={max(per_team.values(), default=0)}; "
+          f"shape ok={all(isinstance(b, dict) and b.get('teams') for b in boxes.values())}")
     print('warnings:')
     for w in d.get('warnings', []):
         print('  -', w[:400])

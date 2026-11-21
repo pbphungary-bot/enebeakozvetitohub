@@ -224,34 +224,63 @@ def collect_rosters(teams, previous=None):
     return rosters,errors
 
 def parse_boxscore(raw):
-    """Normalize ESPN summary player box scores into cacheable rows."""
-    out=[]
+    """Normalize an ESPN summary into {'teams': [{'team','labels','players':[{'id','name','stats'}]}]}.
+
+    Stat labels are stored once per team instead of once per player (about 40% smaller) and
+    become the column headers of the box-score table.
+    """
+    teams=[]
     for block in as_list(obj(raw.get('boxscore')).get('players')):
         club=obj(block.get('team')).get('displayName','')
         for group in as_list(block.get('statistics')):
-            labels=as_list(group.get('labels'))
-            for item in as_list(group.get('athletes')):
-                athlete=obj(item.get('athlete'))
-                if not athlete.get('id'):continue
-                out.append({'team':club,'id':str(athlete['id']),
-                    'name':athlete.get('displayName',''),
-                    'stats':as_list(item.get('stats')),'labels':labels})
-    return out
+            players=[{'id':str(obj(item.get('athlete'))['id']),'name':obj(item.get('athlete')).get('displayName',''),'stats':as_list(item.get('stats'))}
+                     for item in as_list(group.get('athletes')) if obj(item.get('athlete')).get('id')]
+            if players:teams.append({'team':club,'labels':as_list(group.get('labels')),'players':players})
+    return {'teams':teams}
 
-def collect_boxscores(games, cached=None, max_games=25):
-    """Precache recent completed games so the browser need not call ESPN directly."""
-    old=obj(cached);result={k:v for k,v in old.items() if as_list(v)};errors=[]
-    recent=sorted((g for g in games if g.get('completed')),key=lambda g:g.get('date',''),reverse=True)[:max_games]
-    for game in recent:
-        gid=str(game['id'])
-        if as_list(old.get(gid)):
-            result[gid]=old[gid];continue
+def normalize_boxscore(value):
+    """Return the current box-score shape, converting the legacy flat per-player rows; None if empty."""
+    if isinstance(value,dict):return value if as_list(value.get('teams')) else None
+    rows=[r for r in as_list(value) if isinstance(r,dict) and r.get('id')]
+    if not rows:return None
+    groups={}
+    for r in rows:
+        key=(r.get('team',''),tuple(as_list(r.get('labels'))))
+        groups.setdefault(key,{'team':key[0],'labels':list(key[1]),'players':[]})['players'].append({'id':str(r['id']),'name':r.get('name',''),'stats':as_list(r.get('stats'))})
+    return {'teams':list(groups.values())}
+
+def wanted_boxscore_ids(games, per_team=10, season_start=''):
+    """Ids of each team's most recent completed non-preseason games: exactly what the Team page lists, newest first."""
+    recent=sorted((g for g in games if g.get('completed') and str(g.get('seasonType'))!='1' and str(g.get('date',''))[:10]>=season_start),key=lambda g:g.get('date',''),reverse=True)
+    counts={};ids=[]
+    for g in recent:
+        take=False
+        for side in ('home','away'):
+            tid=obj(g.get(side)).get('id')
+            if tid and counts.get(tid,0)<per_team:counts[tid]=counts.get(tid,0)+1;take=True
+        if take:ids.append(str(g['id']))
+    return ids
+
+def collect_boxscores(games, cached=None, per_team=10, season_start='', batch=40):
+    """Cache player box scores for each team's last `per_team` games so the browser need not call ESPN.
+
+    Retention is bounded to that set (it previously grew without limit, about 7 MB by season's end).
+    At most `batch` missing games are fetched per run, newest first; the rest fill in on later runs.
+    """
+    old=obj(cached);result={};missing=[];errors=[]
+    wanted=wanted_boxscore_ids(games,per_team,season_start)
+    for gid in wanted:
+        box=normalize_boxscore(old.get(gid))
+        if box:result[gid]=box
+        else:missing.append(gid)
+    for gid in missing[:batch]:
         try:
-            rows=parse_boxscore(get(BASE+'/summary?event='+urllib.parse.quote(gid,safe='')))
-            if not rows:raise ValueError('no player box-score rows')
-            result[gid]=rows
+            box=parse_boxscore(get(BASE+'/summary?event='+urllib.parse.quote(gid,safe='')))
+            if not box['teams']:raise ValueError('no player box-score rows')
+            result[gid]=box
         except Exception as exc:
             errors.append(f'Box score {gid} unavailable: {exc}')
+    if len(missing)>batch:errors.append(f'Box scores: {len(result)} of {len(wanted)} recent games cached; {len(missing)-batch} more will be added on later refreshes')
     return result,errors
 
 def clean_text(value):
@@ -530,7 +559,7 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,histo
     print("[NBA] Fetching rosters and player box scores",flush=True)
     rosters,roster_errors=collect_rosters(teams,obj(cached).get('rosters'))
     errors.extend(roster_errors)
-    boxscores,box_errors=collect_boxscores(games.values(),obj(cached).get('boxscores'))
+    boxscores,box_errors=collect_boxscores(games.values(),obj(cached).get('boxscores'),season_start=season_start.isoformat())
     errors.extend(box_errors)
     end_year=today.year+1 if today.month>=7 else today.year  # ESPN labels 2026-27 as 2027
     cache=obj(cached)
