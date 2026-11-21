@@ -12,12 +12,14 @@ class CacheSafetyTests(unittest.TestCase):
         self.assertNotIn('2025-01-15',r['daysFetched'])
         self.assertIn('2025-01-15',r['missing'])
         self.assertTrue(r['failures'])
-    def test_cached_boxscores_are_retained(self):
-        old={'oldgame':[{'id':'p1','name':'Player'}]}
-        games=[{'id':'newgame','date':'2026-11-19','completed':True}]
+    def test_cached_boxscores_survive_a_failed_refresh_when_still_wanted(self):
+        old={'oldgame':{'teams':[{'team':'A','labels':['PTS'],'players':[{'id':'p1'}]}]},'dropped':{'teams':[{'team':'A','labels':[],'players':[{'id':'p2'}]}]}}
+        games=[{'id':'oldgame','date':'2026-11-17','completed':True,'seasonType':'2','home':{'id':'1'},'away':{'id':'2'}},
+               {'id':'newgame','date':'2026-11-19','completed':True,'seasonType':'2','home':{'id':'1'},'away':{'id':'2'}}]
         with patch.object(m,'get',side_effect=RuntimeError('offline')):
-            result,errors=m.collect_boxscores(games,old,max_games=25)
-        self.assertIn('oldgame',result)
+            result,errors=m.collect_boxscores(games,old,per_team=10)
+        self.assertIn('oldgame',result)        # cached, still within the window: kept despite the outage
+        self.assertNotIn('dropped',result)     # not one of any team's recent games: no longer retained
         self.assertTrue(errors)
 
 if __name__=='__main__':unittest.main()

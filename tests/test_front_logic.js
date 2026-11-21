@@ -5,7 +5,7 @@ const m = html.match(/\/\*LOGIC-START\*\/([\s\S]*?)\/\*LOGIC-END\*\//);
 assert(m, 'LOGIC block markers missing from index.html');
 const ctx = {};
 vm.createContext(ctx);
-vm.runInContext(m[1] + ';this.api={teamInjuries,injuryState,injuryClass,dateOnly,compareRows,SEASON_TYPE,scoreOf,seasonTypeLabel,complete,mergeGames,formGames,regularGames,h2hFrom,h2hSplit,historyCoverage,hydrateHistory,date,dateTime,tipoff,officialRecord,confSeed,splitStat,standingsByConference,record,won}', ctx);
+vm.runInContext(m[1] + ';this.api={boxTeams,parseBoxscore,splitNotices,teamInjuries,injuryState,injuryClass,dateOnly,compareRows,SEASON_TYPE,scoreOf,seasonTypeLabel,complete,mergeGames,formGames,regularGames,h2hFrom,h2hSplit,historyCoverage,hydrateHistory,date,dateTime,tipoff,officialRecord,confSeed,splitStat,standingsByConference,record,won}', ctx);
 const A = ctx.api;
 let n = 0;
 const test = (name, fn) => { fn(); n++; };
@@ -209,6 +209,33 @@ test('equal values highlight neither team and a missing team does not crash', ()
   assert.deepStrictEqual([rows[0].rows[0].aBetter, rows[0].rows[0].bBetter], [false, false]);
   assert.strictEqual(A.compareRows(undefined, undefined).length, 4);
   assert.strictEqual(A.compareRows(undefined, { ppg: 100 })[0].rows[0].a, '—');
+});
+
+// ---- box scores and data notes
+test('box scores: current shape passes through, legacy flat rows are regrouped per team', () => {
+  const current = { teams: [{ team: 'A', labels: ['PTS'], players: [{ id: '1' }] }] };
+  assert.strictEqual(A.boxTeams(current), current.teams);
+  const legacy = [{ team: 'A', id: '1', name: 'X', stats: ['2'], labels: ['PTS'] }, { team: 'A', id: '2', name: 'Y', stats: ['3'], labels: ['PTS'] }, { team: 'B', id: '3', name: 'Z', stats: ['4'], labels: ['PTS'] }];
+  const t = A.boxTeams(legacy);
+  assert.deepStrictEqual([t.length, t[0].players.length, t[0].labels[0], t[1].team], [2, 2, 'PTS', 'B']);
+  assert.deepStrictEqual(Array.from(A.boxTeams(null)), []);
+  assert.deepStrictEqual(Array.from(A.boxTeams(undefined)), []);
+  assert.deepStrictEqual(Array.from(A.boxTeams([null])), []);
+});
+
+test('browser fallback parsing matches the collector shape and skips id-less rows', () => {
+  const raw = { boxscore: { players: [{ team: { displayName: 'Knicks' }, statistics: [{ labels: ['MIN', 'PTS'], athletes: [{ athlete: { id: 7, displayName: 'P' }, stats: ['30', '21'] }, { athlete: { displayName: 'No id' }, stats: ['1', '1'] }] }] }] } };
+  const t = A.parseBoxscore(raw);
+  assert.deepStrictEqual([t.length, t[0].team, t[0].labels.join(), t[0].players.length, t[0].players[0].id], [1, 'Knicks', 'MIN,PTS', 1, '7']);
+  assert.deepStrictEqual(Array.from(A.parseBoxscore({})), []);
+});
+
+test('only core-data failures are prominent; everything else is a collapsed data note', () => {
+  const n = A.splitNotices(['standings: HTTP 500', 'Historical coverage incomplete: 500 of 1093 days', 'ESPN RSS: empty', 'Current-season days not verified: 2',
+    'Upcoming fixture request failures: 3', 'ATL roster unavailable: x', 'Box scores: 20 of 150 recent games cached; 130 more will be added on later refreshes', 'Excluded 4 non-NBA events']);
+  assert.deepStrictEqual(Array.from(n.critical), ['standings: HTTP 500', 'Current-season days not verified: 2', 'Upcoming fixture request failures: 3', 'ATL roster unavailable: x']);
+  assert.strictEqual(n.info.length, 4);
+  assert.deepStrictEqual([A.splitNotices(undefined).critical.length, A.splitNotices([]).info.length, A.splitNotices([null, '']).info.length], [0, 0, 0]);
 });
 
 console.log(`${n} front-end logic tests passed`);
