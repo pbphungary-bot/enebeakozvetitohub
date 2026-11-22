@@ -492,7 +492,7 @@ def injury_report():
             name=ath.get('displayName','')
             if not name:continue
             rows.append({'playerId':injury_player_id(ath),'name':name,'position':obj(ath.get('position')).get('abbreviation',''),
-                'status':item.get('status',''),'injury':' '.join(x for x in (det.get('side'),det.get('type'),det.get('detail')) if x),
+                'status':item.get('status',''),'injury':' '.join(x for x in (det.get('side'),det.get('type'),det.get('detail')) if x and str(x).strip().lower()!='not specified'),
                 'returnDate':det.get('returnDate',''),'date':item.get('date',''),'comment':clean_text(item.get('shortComment',''))[:300]})
         report[tid]=rows
     return report,str(raw.get('timestamp',''))
@@ -504,7 +504,7 @@ def refresh_cached(label, fetch, cached, errors):
         errors.append(f'{label}: {"cached after fetch failure" if cached else "unavailable"} ({exc})'[:300])
         return None
 
-def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,history_batch=250):
+def collect(today,days_forward=14,history_years=4,cached=None,history_batch=250):
     print("[NBA] Fetching 30 teams",flush=True)
     teams=team_list()
     if len(teams)<28:raise RuntimeError(f'Only {len(teams)} NBA teams returned; refusing incomplete output')
@@ -577,9 +577,9 @@ def collect(today,days_back=35,days_forward=14,history_years=4,cached=None,histo
             history_complete=False;errors.extend('History sanity: '+x for x in problems)
     return {'history':history,'historyDaysFetched':hist['daysFetched'],'historyTotalDays':hist['totalDays'],'historyMissingCount':len(hist['missing']),
         'historyStart':hist['start'],'historyEnd':hist['end'],'historyComplete':history_complete,
-        'seasonComplete':not season_missing and any(g.get('completed') for g in season_games),'seasonDaysFetched':season_days,'seasonMissingDays':season_missing,'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerSeason':player_season if player_season is not None else obj(cache.get('playerSeason')),'teamStats':team_stats if team_stats is not None else obj(cache.get('teamStats')),'injuries':injured[0] if injured else obj(cache.get('injuries')),'injuriesAsOf':injured[1] if injured else cache.get('injuriesAsOf',''),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysBack':days_back,'daysForward':days_forward}}
+        'seasonComplete':not season_missing and any(g.get('completed') for g in season_games),'seasonDaysFetched':season_days,'seasonMissingDays':season_missing,'generatedAt':dt.datetime.now(dt.timezone.utc).isoformat(),'seasonStart':season_start.isoformat(),'playerSeason':player_season if player_season is not None else obj(cache.get('playerSeason')),'teamStats':team_stats if team_stats is not None else obj(cache.get('teamStats')),'injuries':injured[0] if injured else obj(cache.get('injuries')),'injuriesAsOf':injured[1] if injured else cache.get('injuriesAsOf',''),'season':f'{today.year if today.month>=7 else today.year-1}-{str((today.year+1 if today.month>=7 else today.year)%100).zfill(2)}','teams':teams,'rosters':rosters,'boxscores':boxscores,'games':sorted(games.values(),key=lambda g:g['date']),'standings':standing,'news':articles,'warnings':errors,'coverage':{'daysForward':days_forward}}
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--date',default=dt.date.today().isoformat());p.add_argument('--days-back',type=int,default=35);p.add_argument('--days-forward',type=int,default=14);p.add_argument('--history-years',type=int,default=4,help='completed seasons of H2H history');p.add_argument('--history-batch',type=int,default=250,help='max historical days fetched per run (0 = all)');p.add_argument('--output',default=str(ROOT/'data'/'nba.json'));a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--date',default=dt.date.today().isoformat());p.add_argument('--days-forward',type=int,default=14);p.add_argument('--history-years',type=int,default=4,help='completed seasons of H2H history');p.add_argument('--history-batch',type=int,default=250,help='max historical days fetched per run (0 = all)');p.add_argument('--output',default=str(ROOT/'data'/'nba.json'));a=p.parse_args()
     dest=pathlib.Path(a.output)
     cached=None
     if dest.exists():
@@ -587,7 +587,7 @@ def main():
             cached=json.loads(dest.read_text(encoding='utf-8'))
         except (ValueError,OSError):
             pass
-    result=collect(dt.date.fromisoformat(a.date),a.days_back,a.days_forward,a.history_years,cached=cached,history_batch=a.history_batch)
+    result=collect(dt.date.fromisoformat(a.date),a.days_forward,a.history_years,cached=cached,history_batch=a.history_batch)
     dest.parent.mkdir(parents=True,exist_ok=True)
     # Final boundary: sanitize every game, including cached and merged sources,
     # immediately before validation and publication. ESPN can return exhibition
